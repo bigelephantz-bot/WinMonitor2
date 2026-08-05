@@ -1,0 +1,7 @@
+bin/
+obj/
+dist/
+*.user
+crash.log
+config.json
+ec-probe*.json
