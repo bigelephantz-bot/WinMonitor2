@@ -18,7 +18,22 @@ $dotnet = "dotnet"
 $localDotnet = Join-Path $env:LOCALAPPDATA "Microsoft\dotnet\dotnet.exe"
 $systemHasSdk = $false
 try { $systemHasSdk = [bool](& dotnet --list-sdks 2>$null) } catch { }
-if (-not $systemHasSdk -and (Test-Path -LiteralPath $localDotnet)) { $dotnet = $localDotnet }
+if (-not $systemHasSdk) {
+    if (Test-Path -LiteralPath $localDotnet) {
+        $dotnet = $localDotnet
+    }
+    else {
+        # Codex Desktop can provide a workspace SDK under the temporary directory.
+        $dotnet = Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter "dotnet-sdk-*" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object { Join-Path $_.FullName "dotnet.exe" } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+    }
+}
+if ([string]::IsNullOrWhiteSpace($dotnet) -or -not [bool](& $dotnet --list-sdks 2>$null)) {
+    throw ".NET SDK not found. Install the .NET 10 SDK before publishing."
+}
 
 function Invoke-RobocopyMirror {
     param(
@@ -119,6 +134,25 @@ try {
 
     if (-not (Test-Path -LiteralPath (Join-Path $publishStage "WinMonitor.exe"))) {
         throw "Publish output is incomplete: WinMonitor.exe was not produced."
+    }
+
+    # A release without these files would not preserve WinMonitor's license or the
+    # notices and source references required by redistributed dependencies.
+    $requiredLegalFiles = @(
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "licenses\MPL-2.0.txt",
+        "licenses\Apache-2.0.txt",
+        "licenses\DOTNET-LICENSE.txt",
+        "licenses\DOTNET-THIRD-PARTY-NOTICES.txt",
+        "licenses\MONO-LICENSE.txt",
+        "licenses\MONO-PATENTS.txt",
+        "licenses\LIBREHARDWAREMONITOR-THIRD-PARTY-NOTICES.txt"
+    )
+    foreach ($relativePath in $requiredLegalFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $publishStage $relativePath))) {
+            throw "Publish output is missing required legal file: $relativePath"
+        }
     }
 
     # Preserve portable user state while replacing only the application payload.

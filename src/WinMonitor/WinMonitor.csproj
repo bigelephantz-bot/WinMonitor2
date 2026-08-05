@@ -12,9 +12,11 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <Product>WinMonitor</Product>
-    <Copyright>Open source</Copyright>
+    <Authors>Michael Lin</Authors>
+    <Copyright>Copyright (c) 2026 Michael Lin</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <!-- Lean runtime behavior: workstation GC, no concurrent GC background thread churn -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
@@ -35,6 +37,10 @@
   <ItemGroup>
     <!-- Signed PawnIO EC module, copied next to the exe for LG fan reading. -->
     <Content Include="pawnio\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Keep project and third-party license terms beside every distributed executable. -->
+    <Content Include="..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\licenses\**\*" Link="licenses\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

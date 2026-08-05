@@ -61,4 +61,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1
 
 ## 授權
 
-目前尚未加入整個專案適用的授權檔。第三方元件仍適用各自的授權條款，包括 LibreHardwareMonitorLib（MPL-2.0）與 PawnIO EC module（LGPL-2.1-or-later）；重新散布前請先確認相關條款。
+WinMonitor 自有原始碼之著作權為 Copyright (c) 2026 Michael Lin，並以 [MIT License](LICENSE) 開放使用。第三方元件仍適用各自的授權；確切版本、原始碼位置及隨程式散布的授權全文，請參閱 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) 與 `licenses/`。Release 壓縮檔會包含這些文件，重新散布 WinMonitor 時必須一併保留。
