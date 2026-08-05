@@ -61,4 +61,4 @@ Sensor availability depends on the hardware, firmware, privileges, and driver ve
 
 ## Licensing
 
-No project-wide license file is currently included. Third-party components retain their own licenses, including LibreHardwareMonitorLib (MPL-2.0) and the PawnIO EC module (LGPL-2.1-or-later). Review those terms before redistribution.
+WinMonitor's original source code is Copyright (c) 2026 Michael Lin and is available under the [MIT License](LICENSE). Third-party components retain their own licenses; exact versions, source locations, and redistributed license texts are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `licenses/`. Release archives include these files and they must be preserved when redistributing WinMonitor.
