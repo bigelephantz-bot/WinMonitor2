@@ -574,6 +574,14 @@ public sealed class SensorService : IDisposable
         // Dispose can race a rescan (Stop's Join has a timeout). Never reopen a Computer
         // once shutdown began — a resurrected instance keeps the LHM kernel driver loaded.
         if (IsShuttingDown()) return;
+
+        // Resume/rescan must not reuse stale native sessions. Allow both direct Intel status
+        // and EC initialization to retry after sleep, a driver restart, or an earlier failure.
+        try { _intelThermalStatus?.Dispose(); } catch { }
+        _intelThermalStatus = null;
+        _intelThermalStatusInitializationAttempted = false;
+        try { _ec.Reset(); } catch { }
+
         OpenComputer();
         if (IsShuttingDown())
         {

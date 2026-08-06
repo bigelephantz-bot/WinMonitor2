@@ -514,9 +514,10 @@ public sealed class TrayIconManager : IDisposable
             }
             case SensorQuantity.Fan:
                 // "3.4k" for 3400 RPM keeps it to 4 glyphs; tooltip carries the exact RPM.
-                return v >= 1000f
+                string rpm = v >= 1000f
                     ? (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture) + "k"
                     : ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
+                return showUnit ? rpm + "RPM" : rpm;
             case SensorQuantity.Level:
             case SensorQuantity.Load:
             case SensorQuantity.Control:
@@ -531,12 +532,31 @@ public sealed class TrayIconManager : IDisposable
             }
             case SensorQuantity.Frequency:
             {
-                // Frequencies arrive in MHz. Keep the glyph compact; the tooltip shows precision.
-                string ghz = (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture);
-                return showUnit ? ghz + "G" : ghz;
+                // Frequencies arrive in MHz; use the canonical unit rather than an ambiguous G.
+                if (v >= 1000f)
+                {
+                    string ghz = (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture);
+                    return showUnit ? ghz + "GHz" : ghz;
+                }
+                string mhz = MathF.Round(v).ToString(CultureInfo.InvariantCulture);
+                return showUnit ? mhz + "MHz" : mhz;
+            }
+            case SensorQuantity.Voltage:
+            {
+                string voltage = v.ToString("0.#", CultureInfo.InvariantCulture);
+                return showUnit ? voltage + "V" : voltage;
+            }
+            case SensorQuantity.Data:
+            {
+                if (v >= 1024f)
+                {
+                    string tb = (v / 1024f).ToString("0.#", CultureInfo.InvariantCulture);
+                    return showUnit ? tb + "TB" : tb;
+                }
+                string gb = v.ToString("0.#", CultureInfo.InvariantCulture);
+                return showUnit ? gb + "GB" : gb;
             }
             default:
-                // Voltage/Data reach the tray only by explicit user choice; keep it short.
                 return v.ToString("0.#", CultureInfo.InvariantCulture);
         }
     }

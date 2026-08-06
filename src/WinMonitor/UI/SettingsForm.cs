@@ -84,9 +84,11 @@ public sealed partial class SettingsForm : Form
 
     private void OnOk(object? sender, EventArgs e)
     {
-        _finished = true;
-        ApplyOwnSettings();
-        Close();
+        if (ApplyOwnSettings())
+        {
+            _finished = true;
+            Close();
+        }
     }
 
     private void OnCancel(object? sender, EventArgs e)
@@ -101,20 +103,31 @@ public sealed partial class SettingsForm : Form
     }
 
     /// <summary>Merges and persists this form's draft, without overwriting unrelated live changes.</summary>
-    private void ApplyOwnSettings()
+    private bool ApplyOwnSettings()
     {
         RebaseDraftIfLiveChanged(refreshControls: false);
-        CommitDraftIntoLiveConfig();
+        AppConfig candidate = BuildMergedConfig();
         _applying = true;
-        try { _ctx.ApplySettings(); }
+        try
+        {
+            _ctx.ApplySettings(candidate);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, Loc.T("common.error"),
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
         finally
         {
             _applying = false;
-            ResetDraftFromLiveConfig();
-            // Startup registration can reject a setting after SettingsApplied is raised; reload
-            // once more from the final live result so the dialog never shows a value that failed.
-            if (!IsDisposed && !Disposing) LoadAllTabs();
         }
+
+        ResetDraftFromLiveConfig();
+        // Startup registration can reject a setting after SettingsApplied is raised; reload
+        // once more from the final live result so the dialog never shows a value that failed.
+        if (!IsDisposed && !Disposing) LoadAllTabs();
+        return true;
     }
 
     private void OnSettingsApplied()
@@ -175,14 +188,13 @@ public sealed partial class SettingsForm : Form
         if (refreshControls) LoadAllTabs();
     }
 
-    private void CommitDraftIntoLiveConfig()
+    private AppConfig BuildMergedConfig()
     {
         var baseline = JsonNode.Parse(_baselineConfigJson);
         var draft = JsonSerializer.SerializeToNode(Config);
         var live = JsonNode.Parse(SerializeConfig(_ctx.Config));
         var merged = MergeDraftNode(baseline, draft, live, propertyName: null);
-        var result = merged?.Deserialize<AppConfig>() ?? Config;
-        _ctx.ReplaceConfig(result);
+        return merged?.Deserialize<AppConfig>() ?? Config;
     }
 
     private void ResetDraftFromLiveConfig()

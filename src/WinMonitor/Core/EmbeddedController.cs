@@ -38,7 +38,6 @@ public sealed class EmbeddedController : IDisposable
     private readonly object _lock = new();
     private PawnIo? _pawn;
     private Mutex? _ecMutex;
-    private bool _loaded;
     private bool _disposed;
 
     public bool Available { get; private set; }
@@ -54,8 +53,9 @@ public sealed class EmbeddedController : IDisposable
     {
         lock (_lock)
         {
-            if (_loaded) return Available;
-            _loaded = true;
+            if (_disposed) return false;
+            if (Available && _pawn is not null) return true;
+            ResetConnectionLocked();
 
             if (!PawnIo.LibraryPresent)
             {
@@ -126,6 +126,7 @@ public sealed class EmbeddedController : IDisposable
             if (!Available || _pawn is null) return data;
             var sw = Stopwatch.StartNew();
             bool held = AcquireEcMutex(out _);
+            if (_ecMutex is not null && !held) return data;
             try
             {
                 DrainObf();
@@ -161,6 +162,7 @@ public sealed class EmbeddedController : IDisposable
             if (!Available || _pawn is null) return data;
             var sw = Stopwatch.StartNew();
             bool held = AcquireEcMutex(out _);
+            if (_ecMutex is not null && !held) return data;
             try
             {
                 DrainObf();
@@ -273,17 +275,33 @@ public sealed class EmbeddedController : IDisposable
         try { _ecMutex?.ReleaseMutex(); } catch { }
     }
 
+    /// <summary>Drops native handles so a hardware rescan/resume can establish a fresh session.</summary>
+    public void Reset()
+    {
+        lock (_lock)
+        {
+            if (_disposed) return;
+            ResetConnectionLocked();
+            UnavailableReason = null;
+        }
+    }
+
+    private void ResetConnectionLocked()
+    {
+        Available = false;
+        try { _ecMutex?.Dispose(); } catch { }
+        _ecMutex = null;
+        try { _pawn?.Dispose(); } catch { }
+        _pawn = null;
+    }
+
     public void Dispose()
     {
         lock (_lock)
         {
             if (_disposed) return;
             _disposed = true;
-            Available = false;
-            try { _ecMutex?.Dispose(); } catch { }
-            _ecMutex = null;
-            try { _pawn?.Dispose(); } catch { }
-            _pawn = null;
+            ResetConnectionLocked();
         }
     }
 }

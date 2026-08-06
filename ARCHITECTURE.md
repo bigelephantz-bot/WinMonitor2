@@ -24,6 +24,7 @@ SensorService (bg thread, LHM Computer)  --SnapshotUpdated event-->
 
 ## Key types (already written — read these files first)
 - `Core/Models.cs` — `SensorCategory`, `SensorQuantity`, `SensorDescriptor`, `SensorSnapshot`, `SessionStats`, `Units`, `RingBuffer<T>`.
+- `Core/SessionHistoryStore.cs` — append-only temporary-file spool used to preserve full-session CSV history with bounded process memory.
 - `Config/AppConfig.cs` — full JSON config schema: `AppConfig`, `Profile`, `TrayIconConfig`, `Thresholds`, `SensorOverride`, `LoggingConfig`. `ConfigStore` (in ConfigStore.cs) persists it.
 - `Localization/Loc.cs` — `Loc.T(key)`, `Loc.Current` ("en" / "zh-TW"), falls back to the key itself, then en.
 - `Program.cs` — composition root; shows how everything is wired. `WinMonitorContext` owns all services and the hidden `SyncWindow` used for marshaling + TaskbarCreated re-registration.
@@ -55,19 +56,21 @@ public sealed class SensorService : IDisposable
 
 ### Core/StatsTracker.cs
 ```csharp
-public sealed class StatsTracker
+public sealed class StatsTracker : IDisposable
 {
     public StatsTracker(int historyCapacity = 3600);
     public void Accept(SensorSnapshot[] snapshots);           // called on bg thread
     public SessionStats? GetStats(string sensorId);
     public float? GetLatestValue(string sensorId);
     public IReadOnlyList<TimedValue> GetHistory(string sensorId); // complete session copy for CSV
+    public string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors); // streaming session export
     public HistoryReadResult GetHistoryIfChanged(string sensorId, long knownVersion); // bounded chart copy
     public void ResetPeaks();                                  // clears stats/chart, keeps export history
+    public void Dispose();                                     // closes and deletes the session spool
 }
 public readonly record struct TimedValue(DateTime Utc, float Value);
 ```
-Track every valid sensor sample so a time-series export contains the complete application run. Thread-safe (lock per call is fine).
+Track every valid sensor sample so a time-series export contains the complete application run. Keep complete history in an append-only temporary spool and chart history in bounded rings. Thread-safe (lock per call is fine).
 
 ### Core/AlertEngine.cs
 ```csharp
