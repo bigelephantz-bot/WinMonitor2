@@ -1,6 +1,7 @@
 using System.Reflection;
 using WinMonitor.Config;
 using WinMonitor.Core;
+using WinMonitor.Tray;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -9,7 +10,9 @@ var tests = new (string Name, Action Run)[]
     (nameof(SuppressedStorageReferenceTests), SuppressedStorageReferenceTests),
     (nameof(ProfileAlertTests), ProfileAlertTests),
     (nameof(HistoryLayoutFingerprintTests), HistoryLayoutFingerprintTests),
+    (nameof(HistoryLoggerDisableTests), HistoryLoggerDisableTests),
     (nameof(CsvExportTests), CsvExportTests),
+    (nameof(TrayUnitFormattingTests), TrayUnitFormattingTests),
     (nameof(IntelThermalStatusDecodeTests), IntelThermalStatusDecodeTests),
 };
 
@@ -34,7 +37,7 @@ return failures == 0 ? 0 : 1;
 static void StatsTrackerHistoryTests()
 {
     const string sensorId = "/cpu/package/temperature/0";
-    var tracker = new StatsTracker(historyCapacity: 3);
+    using var tracker = new StatsTracker(historyCapacity: 3);
 
     HistoryReadResult initial = tracker.GetHistoryIfChanged(sensorId, -1);
     Check.True(initial.Values is { Length: 0 }, "First history read should arm an empty ring.");
@@ -63,6 +66,15 @@ static void StatsTrackerHistoryTests()
     tracker.Accept(new[] { Sample(unchartedId, 12f, firstTime.AddSeconds(2)) });
     Check.Equal(1, tracker.GetHistory(unchartedId).Count,
         "CSV history must record sensors even when no chart requested them first.");
+
+    const string lateChartId = "/cpu/package/frequency/0";
+    for (int i = 0; i < 4; i++)
+        tracker.Accept(new[] { Sample(lateChartId, 1000f + i, firstTime.AddSeconds(3 + i)) });
+    HistoryReadResult late = tracker.GetHistoryIfChanged(lateChartId, -1);
+    Check.True(late.Values is { Length: 3 },
+        "A chart opened later should receive the existing bounded history immediately.");
+    Check.Equal(1001f, late.Values![0].Value, "Late chart history should retain the oldest in-capacity sample.");
+    Check.Equal(1003f, late.Values[2].Value, "Late chart history should include the newest sample.");
 }
 
 static void ConfigSanitizationTests()
@@ -219,26 +231,19 @@ static void CsvExportTests()
             Quantity = SensorQuantity.Level,
         };
         DateTime first = new(2026, 8, 5, 10, 0, 0, DateTimeKind.Utc);
-        var histories = new Dictionary<string, IReadOnlyList<TimedValue>>(StringComparer.Ordinal)
+        using var tracker = new StatsTracker(historyCapacity: 1);
+        tracker.Accept(new[]
         {
-            [descriptor.Id] = new[]
-            {
-                new TimedValue(first, 1.5f),
-                new TimedValue(first.AddSeconds(1), 3.5f),
-            },
-            [throttle.Id] = new[]
-            {
-                new TimedValue(first, 0f),
-                new TimedValue(first.AddSeconds(1), 1f),
-            },
-        };
+            Sample(descriptor.Id, 1.5f, first),
+            Sample(throttle.Id, 0f, first),
+        });
+        tracker.Accept(new[]
+        {
+            Sample(descriptor.Id, 3.5f, first.AddSeconds(1)),
+            Sample(throttle.Id, 1f, first.AddSeconds(1)),
+        });
 
-        HistoryLogger.ExportTimeSeriesCsv(
-            path,
-            new[] { descriptor, throttle },
-            id => histories.TryGetValue(id, out IReadOnlyList<TimedValue>? values)
-                ? values
-                : Array.Empty<TimedValue>());
+        tracker.ExportTimeSeriesCsv(path, new[] { descriptor, throttle });
         string csv = File.ReadAllText(path);
         Check.True(csv.Contains(
             "\"Desk, \"\"A\"\" / Core, \"\"One\"\" [Temperature]\"",
@@ -255,6 +260,24 @@ static void CsvExportTests()
     }
 }
 
+static void HistoryLoggerDisableTests()
+{
+    var config = new AppConfig { Logging = new LoggingConfig { Enabled = false } };
+    using var logger = new HistoryLogger(config, () => Array.Empty<SensorDescriptor>());
+    FieldInfo? writerField = typeof(HistoryLogger).GetField(
+        "_writer", BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(writerField is not null, "History logger writer field should exist.");
+
+    var stream = new MemoryStream();
+    var writer = new StreamWriter(stream);
+    writerField!.SetValue(logger, writer);
+    logger.Accept(Array.Empty<SensorSnapshot>());
+
+    Check.True(writerField.GetValue(logger) is null,
+        "Disabling logging should immediately release the open writer.");
+    Check.True(!stream.CanWrite, "Disabling logging should close the underlying file stream.");
+}
+
 static void IntelThermalStatusDecodeTests()
 {
     Type? type = typeof(StatsTracker).Assembly.GetType("WinMonitor.Core.IntelThermalStatusReader");
@@ -266,6 +289,33 @@ static void IntelThermalStatusDecodeTests()
     Check.True(Decode(1UL << 0), "The current thermal-status bit must be true.");
     Check.True(Decode(1UL << 2), "The current PROCHOT-status bit must be true.");
     Check.True(!Decode((1UL << 1) | (1UL << 3)), "Sticky log bits must not report current throttling.");
+}
+
+static void TrayUnitFormattingTests()
+{
+    MethodInfo? format = typeof(TrayIconManager).GetMethod(
+        "FormatShort", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(format is not null, "Tray compact formatter should exist.");
+
+    string Format(SensorQuantity quantity, float value, bool showUnit = true)
+    {
+        var descriptor = new SensorDescriptor
+        {
+            Id = "/test/" + quantity,
+            HardwareName = "Test",
+            Name = quantity.ToString(),
+            Category = SensorCategory.Other,
+            Quantity = quantity,
+        };
+        return (string)format!.Invoke(null, new object?[] { descriptor, (float?)value, showUnit })!;
+    }
+
+    Check.Equal("3.4kRPM", Format(SensorQuantity.Fan, 3400f), "Fan text should include RPM.");
+    Check.Equal("4.2GHz", Format(SensorQuantity.Frequency, 4200f), "Frequency text should include GHz.");
+    Check.Equal("1.2V", Format(SensorQuantity.Voltage, 1.2f), "Voltage text should include V.");
+    Check.Equal("2TB", Format(SensorQuantity.Data, 2048f), "Large data values should include TB.");
+    Check.Equal("42", Format(SensorQuantity.Load, 42f, showUnit: false),
+        "Disabling units should retain numeric-only tray text.");
 }
 
 static void HistoryLayoutFingerprintTests()

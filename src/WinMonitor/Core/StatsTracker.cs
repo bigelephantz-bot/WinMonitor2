@@ -7,32 +7,35 @@ namespace WinMonitor.Core;
 public readonly record struct HistoryReadResult(long Version, TimedValue[]? Values);
 
 /// <summary>
-/// Session min/max/avg statistics, complete session history for CSV export, and a lazily
-/// allocated bounded chart ring per sensor. Fed by SensorService on the polling thread;
-/// read by the UI, tray and chart. A single lock guards all entries.
+/// Session min/max/avg statistics, disk-spooled complete history for CSV export, and a bounded
+/// chart ring per sensor. Fed by SensorService on the polling thread; read by the UI, tray and
+/// chart. A single lock guards all entries and the append-only spool.
 /// </summary>
-public sealed class StatsTracker
+public sealed class StatsTracker : IDisposable
 {
     // Hard cap on distinct tracked ids so a pathological descriptor stream cannot create
-    // unbounded per-sensor containers. Session histories intentionally grow for the duration
-    // of this process because the CSV contract is "every value since application start";
-    // bounded chart rings remain lazy and independent.
+    // unbounded per-sensor containers.
     private const int MaxTrackedSensors = 512;
 
     private sealed class Entry
     {
         public readonly SessionStats Stats = new();
-        /// <summary>All valid samples since application start; retained for time-series export.</summary>
-        public readonly List<TimedValue> SessionHistory = new();
-        /// <summary>Null until a consumer first requests this sensor's history.</summary>
-        public RingBuffer<TimedValue>? History;
-        /// <summary>Incremented whenever the lazily-created history changes.</summary>
+        public readonly RingBuffer<TimedValue> History;
         public long HistoryVersion;
+        public float LatestValue;
+        public bool HasLatest;
+
+        public Entry(int historyCapacity)
+        {
+            History = new RingBuffer<TimedValue>(historyCapacity);
+        }
     }
 
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly int _historyCapacity;
+    private readonly SessionHistoryStore _sessionHistory = new();
+    private bool _disposed;
 
     public StatsTracker(int historyCapacity = 3600)
     {
@@ -44,6 +47,7 @@ public sealed class StatsTracker
     {
         lock (_gate)
         {
+            if (_disposed) return;
             for (int i = 0; i < snapshots.Length; i++)
             {
                 var s = snapshots[i];
@@ -52,18 +56,17 @@ public sealed class StatsTracker
                 if (!_entries.TryGetValue(s.Id, out var entry))
                 {
                     if (_entries.Count >= MaxTrackedSensors) continue;
-                    entry = new Entry();
+                    entry = new Entry(_historyCapacity);
                     _entries[s.Id] = entry;
                 }
 
                 float v = s.Value.GetValueOrDefault();
                 entry.Stats.Accept(v);
-                entry.SessionHistory.Add(new TimedValue(s.UtcTimestamp, v));
-                if (entry.History is { } history)
-                {
-                    history.Add(new TimedValue(s.UtcTimestamp, v));
-                    entry.HistoryVersion++;
-                }
+                entry.LatestValue = v;
+                entry.HasLatest = true;
+                entry.History.Add(new TimedValue(s.UtcTimestamp, v));
+                entry.HistoryVersion++;
+                _sessionHistory.Append(s.Id, s.UtcTimestamp, v);
             }
         }
     }
@@ -85,9 +88,9 @@ public sealed class StatsTracker
     {
         lock (_gate)
         {
-            if (!_entries.TryGetValue(sensorId, out Entry? entry) || entry.SessionHistory.Count == 0)
+            if (!_entries.TryGetValue(sensorId, out Entry? entry) || !entry.HasLatest)
                 return null;
-            return entry.SessionHistory[^1].Value;
+            return entry.LatestValue;
         }
     }
 
@@ -97,12 +100,39 @@ public sealed class StatsTracker
     /// </summary>
     public IReadOnlyList<TimedValue> GetHistory(string sensorId)
     {
+        SessionHistoryReadSnapshot snapshot;
         lock (_gate)
         {
-            if (!_entries.TryGetValue(sensorId, out Entry? entry) || entry.SessionHistory.Count == 0)
+            if (!_entries.TryGetValue(sensorId, out Entry? entry) || !entry.HasLatest)
                 return Array.Empty<TimedValue>();
-            return entry.SessionHistory.ToArray();
+            snapshot = _sessionHistory.Capture();
         }
+
+        using (snapshot)
+        {
+            int sensorIndex = Array.IndexOf(snapshot.SensorIds, sensorId);
+            if (sensorIndex < 0) return Array.Empty<TimedValue>();
+            var values = new List<TimedValue>();
+            foreach (SessionHistoryRecord record in snapshot.ReadRecords())
+            {
+                if (record.SensorIndex == sensorIndex)
+                    values.Add(new TimedValue(new DateTime(record.UtcTicks, DateTimeKind.Utc), record.Value));
+            }
+            return values;
+        }
+    }
+
+    /// <summary>Streams a stable session snapshot to CSV without materializing all histories.</summary>
+    public string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors)
+    {
+        SessionHistoryReadSnapshot snapshot;
+        lock (_gate)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(StatsTracker));
+            snapshot = _sessionHistory.Capture();
+        }
+        using (snapshot)
+            return HistoryLogger.ExportTimeSeriesCsv(path, descriptors, snapshot);
     }
 
     /// <summary>
@@ -118,20 +148,20 @@ public sealed class StatsTracker
             if (entry is null)
                 return new HistoryReadResult(-1, Array.Empty<TimedValue>());
 
-            RingBuffer<TimedValue> history = entry.History ??= new RingBuffer<TimedValue>(_historyCapacity);
             if (entry.HistoryVersion == knownVersion)
                 return new HistoryReadResult(entry.HistoryVersion, null);
 
-            TimedValue[] values = history.Count > 0 ? history.ToArray() : Array.Empty<TimedValue>();
+            TimedValue[] values = entry.History.Count > 0
+                ? entry.History.ToArray()
+                : Array.Empty<TimedValue>();
             return new HistoryReadResult(entry.HistoryVersion, values);
         }
     }
 
     /// <summary>
     /// Copies the last <paramref name="max"/> values (oldest→newest) into <paramref name="dest"/>
-    /// without allocating (after the sensor's ring is armed by the first call). Returns the
-    /// number written. Used by the tray sparkline so an idle, sparkline-enabled icon allocates
-    /// nothing per tick.
+    /// without allocating for an already-tracked sensor. Returns the number written. Used by the
+    /// tray sparkline so an idle, sparkline-enabled icon allocates nothing per tick.
     /// </summary>
     public int CopyRecentHistory(string sensorId, float[] dest, int max)
     {
@@ -139,8 +169,9 @@ public sealed class StatsTracker
         int want = Math.Min(max, dest.Length);
         lock (_gate)
         {
-            var h = GetOrCreateHistoryLocked(sensorId);
-            if (h is null) return 0;
+            Entry? entry = GetOrCreateEntryLocked(sensorId);
+            if (entry is null) return 0;
+            RingBuffer<TimedValue> h = entry.History;
             int n = Math.Min(want, h.Count);
             int start = h.Count - n;
             for (int i = 0; i < n; i++)
@@ -150,22 +181,13 @@ public sealed class StatsTracker
     }
 
     /// <summary>
-    /// Returns the sensor's history ring, allocating it (and its entry) on first request so
-    /// only sensors actually charted or sparklined ever pay for the buffer. Caller holds _gate.
-    /// Null only when the tracked-sensor cap is hit.
+    /// Gets or creates a tracked entry. Caller holds <see cref="_gate"/>.
     /// </summary>
-    private RingBuffer<TimedValue>? GetOrCreateHistoryLocked(string sensorId)
-    {
-        Entry? entry = GetOrCreateEntryLocked(sensorId);
-        return entry is null ? null : entry.History ??= new RingBuffer<TimedValue>(_historyCapacity);
-    }
-
-    /// <summary>Gets or creates a tracked entry. Caller holds <see cref="_gate"/>.</summary>
     private Entry? GetOrCreateEntryLocked(string sensorId)
     {
         if (_entries.TryGetValue(sensorId, out var entry)) return entry;
         if (_entries.Count >= MaxTrackedSensors) return null;
-        entry = new Entry();
+        entry = new Entry(_historyCapacity);
         _entries[sensorId] = entry;
         return entry;
     }
@@ -181,12 +203,19 @@ public sealed class StatsTracker
             foreach (var entry in _entries.Values)
             {
                 entry.Stats.Reset();
-                if (entry.History is not null)
-                {
-                    entry.History.Clear(); // once allocated, rings are kept and just emptied
-                    entry.HistoryVersion++;
-                }
+                entry.History.Clear();
+                entry.HistoryVersion++;
             }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _sessionHistory.Dispose();
         }
     }
 }

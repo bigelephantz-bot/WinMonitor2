@@ -54,7 +54,15 @@ public sealed class HistoryLogger : IDisposable
     public void Accept(SensorSnapshot[] snapshots)
     {
         AppConfig config = _configProvider();
-        if (_disposed || !config.Logging.Enabled) return;
+        if (_disposed) return;
+        if (!config.Logging.Enabled)
+        {
+            lock (_gate)
+            {
+                if (!_disposed) SafeCloseWriter();
+            }
+            return;
+        }
 
         var nowUtc = DateTime.UtcNow;
         int interval = Math.Max(1, config.Logging.IntervalSeconds);
@@ -145,7 +153,7 @@ public sealed class HistoryLogger : IDisposable
         }
     }
 
-    // ---------- one-shot exports (UI thread; exceptions propagate to the caller) ----------
+    // ---------- one-shot exports (exceptions propagate to the caller) ----------
 
     /// <summary>
     /// Exports every sample retained since application start as a wide time series: one row per
@@ -209,6 +217,81 @@ public sealed class HistoryLogger : IDisposable
         }
         writer.Flush();
         return path;
+    }
+
+    /// <summary>
+    /// Streams a disk-backed session snapshot as a wide time series. Memory use depends only on
+    /// descriptor count, not session duration; records are already in polling-time order.
+    /// </summary>
+    internal static string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
+        SessionHistoryReadSnapshot snapshot)
+    {
+        var descriptorIndexById = new Dictionary<string, int>(descriptors.Count, StringComparer.Ordinal);
+        for (int i = 0; i < descriptors.Count; i++)
+            descriptorIndexById[descriptors[i].Id] = i;
+
+        var columnsBySensorIndex = new int[snapshot.SensorIds.Length];
+        Array.Fill(columnsBySensorIndex, -1);
+        for (int i = 0; i < snapshot.SensorIds.Length; i++)
+            if (descriptorIndexById.TryGetValue(snapshot.SensorIds[i], out int column))
+                columnsBySensorIndex[i] = column;
+
+        var values = new float[descriptors.Count];
+        var present = new bool[descriptors.Count];
+        var touchedColumns = new List<int>(descriptors.Count);
+        using var writer = new StreamWriter(path, append: false, Utf8Bom);
+        var sb = new StringBuilder(Math.Max(256, descriptors.Count * 40));
+        sb.Append("Timestamp");
+        for (int i = 0; i < descriptors.Count; i++)
+        {
+            sb.Append(',');
+            AppendCsvField(sb, ExportColumnName(descriptors[i]));
+        }
+        writer.WriteLine(sb.ToString());
+
+        long currentTicks = long.MinValue;
+        foreach (SessionHistoryRecord record in snapshot.ReadRecords())
+        {
+            if (record.UtcTicks != currentTicks)
+            {
+                if (currentTicks != long.MinValue)
+                    WriteSessionRow(writer, sb, currentTicks, descriptors, values, present);
+                for (int i = 0; i < touchedColumns.Count; i++)
+                    present[touchedColumns[i]] = false;
+                touchedColumns.Clear();
+                currentTicks = record.UtcTicks;
+            }
+
+            if ((uint)record.SensorIndex >= (uint)columnsBySensorIndex.Length) continue;
+            int column = columnsBySensorIndex[record.SensorIndex];
+            if (column < 0) continue;
+            if (!present[column]) touchedColumns.Add(column);
+            present[column] = true;
+            values[column] = record.Value;
+        }
+        if (currentTicks != long.MinValue)
+            WriteSessionRow(writer, sb, currentTicks, descriptors, values, present);
+
+        writer.Flush();
+        return path;
+    }
+
+    private static void WriteSessionRow(StreamWriter writer, StringBuilder sb, long timestamp,
+        IReadOnlyList<SensorDescriptor> descriptors, float[] values, bool[] present)
+    {
+        sb.Clear();
+        sb.Append(new DateTime(timestamp, DateTimeKind.Utc).ToLocalTime()
+            .ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz", CultureInfo.InvariantCulture));
+        for (int i = 0; i < descriptors.Count; i++)
+        {
+            sb.Append(',');
+            if (!present[i]) continue;
+            if (string.Equals(descriptors[i].Id, WellKnown.ThrottleSensorId, StringComparison.Ordinal))
+                sb.Append(values[i] >= 0.5f ? "True" : "False");
+            else
+                sb.Append(values[i].ToString(CultureInfo.InvariantCulture));
+        }
+        writer.WriteLine(sb.ToString());
     }
 
     private static string ExportColumnName(SensorDescriptor descriptor)

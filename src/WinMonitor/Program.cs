@@ -359,7 +359,9 @@ public sealed class WinMonitorContext : ApplicationContext
         bool windowVisible = (_mainForm is { IsDisposed: false, Visible: true } && _mainForm.WindowState != FormWindowState.Minimized)
                           || (_compactForm is { IsDisposed: false, Visible: true })
                           || (_settingsForm is { IsDisposed: false, Visible: true });
-        if (windowVisible)
+        // Background CSV promises a complete row at its configured interval. Smart polling must
+        // therefore keep every descriptor active while logging, even with all windows hidden.
+        if (windowVisible || Config.Logging.Enabled)
         {
             Sensors.SetActiveSensorIds(null);
             return;
@@ -608,10 +610,27 @@ public sealed class WinMonitorContext : ApplicationContext
         });
     }
 
-    /// <summary>Called by SettingsForm after any edit is applied. Propagates + persists.</summary>
+    /// <summary>Persists and applies edits already made directly to the live configuration.</summary>
     public void ApplySettings()
     {
         ConfigStore.Save(Config);
+        ApplySettingsCore();
+    }
+
+    /// <summary>
+    /// Persists a complete settings candidate before publishing it. A save failure therefore
+    /// leaves both the live reference and the running services on their previous configuration.
+    /// </summary>
+    internal void ApplySettings(AppConfig candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        ConfigStore.Save(candidate);
+        ReplaceConfig(candidate);
+        ApplySettingsCore();
+    }
+
+    private void ApplySettingsCore()
+    {
         Loc.Initialize(Config.Language);
         bool wasDark = Theme.IsDark;
         Theme.Initialize(Config.ThemeMode);
@@ -728,26 +747,8 @@ public sealed class WinMonitorContext : ApplicationContext
         _exiting = true;
         UnhookSessionEnding();
         UnhookPowerMode();
-        try
-        {
-            ConfigStore.Save(Config);
-            Sensors.SnapshotUpdated -= OnSnapshot;
-            Sensors.ThrottleStateChanged -= OnThrottleStateChanged;
-            Sensors.Stop();
-            _peakResetTimer.Stop();
-            _peakResetTimer.Dispose();
-            _sync.UnregisterCompactHotkey();
-            _flyout?.Dispose();
-            Tray.Dispose();
-            Logger.Dispose();
-            Sensors.Dispose();
-        }
-        catch (Exception ex) { Program.LogCrash(ex); }
-        finally
-        {
-            _sync.Dispose();
-            ExitThread();
-        }
+        CleanupOwnedResources();
+        ExitThread();
     }
 
     private void InvokeOnUi(Action action)
@@ -798,16 +799,38 @@ public sealed class WinMonitorContext : ApplicationContext
             _exiting = true;
             UnhookSessionEnding();
             UnhookPowerMode();
-            try { ConfigStore.Save(Config); } catch { }
-            try { _peakResetTimer.Dispose(); } catch { }
-            try { _sync.UnregisterCompactHotkey(); } catch { }
-            try { _flyout?.Dispose(); } catch { }
-            try { Tray.Dispose(); } catch { }
-            try { Sensors.Dispose(); } catch { }
-            try { Logger.Dispose(); } catch { }
-            try { _sync.Dispose(); } catch { }
+            CleanupOwnedResources();
         }
         base.Dispose(disposing);
+    }
+
+    /// <summary>
+    /// Best-effort, ordered teardown. Every step is isolated so one failing save or native
+    /// cleanup cannot skip the remaining handles, files, subscriptions, or polling thread.
+    /// </summary>
+    private void CleanupOwnedResources()
+    {
+        TryCleanup(() => ConfigStore.Save(Config));
+        TryCleanup(() => Sensors.SnapshotUpdated -= OnSnapshot);
+        TryCleanup(() => Sensors.DescriptorsChanged -= OnDescriptorsChanged);
+        TryCleanup(() => Sensors.ThrottleStateChanged -= OnThrottleStateChanged);
+        TryCleanup(() => Alerts.AlertRaised -= OnAlert);
+        TryCleanup(Sensors.Stop);
+        TryCleanup(_peakResetTimer.Stop);
+        TryCleanup(_peakResetTimer.Dispose);
+        TryCleanup(_sync.UnregisterCompactHotkey);
+        TryCleanup(() => _flyout?.Dispose());
+        TryCleanup(Tray.Dispose);
+        TryCleanup(Logger.Dispose);
+        TryCleanup(Stats.Dispose);
+        TryCleanup(Sensors.Dispose);
+        TryCleanup(_sync.Dispose);
+    }
+
+    private static void TryCleanup(Action action)
+    {
+        try { action(); }
+        catch (Exception ex) { Program.LogCrash(ex); }
     }
 }
 

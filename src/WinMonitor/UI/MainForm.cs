@@ -31,6 +31,8 @@ public sealed class MainForm : Form
     private static readonly int[] PollValues = { 1000, 2000, 5000 };
     private static readonly string[] PollKeys = { "main.poll.1s", "main.poll.2s", "main.poll.5s" };
     private static readonly int[] ChartMinuteOptions = { 1, 3, 5, 10, 20, 30, 60 };
+    private const int StaticZoneSampleCount = 60;
+    private const float StaticZoneTolerance = 0.05f;
 
     private readonly WinMonitorContext _ctx;
 
@@ -65,7 +67,6 @@ public sealed class MainForm : Form
     private readonly HashSet<string> _temperatureIds = new(StringComparer.Ordinal);
     private readonly List<ChartSeriesSource> _chartSources = new();
     private readonly Func<string, long, HistoryReadResult> _displayHistoryProvider;
-    private readonly Func<string, IReadOnlyList<TimedValue>> _rawHistoryProvider;
     private readonly Action _processSnapshotsAction;   // cached: no delegate alloc per poll tick
 
     private SensorSnapshot[]? _pendingSnapshots;   // latest-wins mailbox, written on the sensor thread
@@ -88,7 +89,6 @@ public sealed class MainForm : Form
     {
         _ctx = ctx;
         _displayHistoryProvider = ProvideDisplayHistory;
-        _rawHistoryProvider = id => _ctx.Stats.GetHistory(id);
         _processSnapshotsAction = ProcessPendingSnapshots;
 
         SuspendLayout();
@@ -461,7 +461,10 @@ public sealed class MainForm : Form
                         Tag = d,
                     };
                     _list.Items.Add(item);
-                    _rowsById[d.Id] = new SensorRow(item, d.Id == WellKnown.ThrottleSensorId);
+                    _rowsById[d.Id] = new SensorRow(
+                        item,
+                        d.Id == WellKnown.ThrottleSensorId,
+                        d.Id.StartsWith("/wmi/thermalzone/", StringComparison.OrdinalIgnoreCase));
                     // Resolve once per rebuild — ResolveThresholds allocates, so keep it off the poll tick.
                     _thresholdsById[d.Id] = _ctx.Config.ResolveThresholds(d);
 
@@ -593,17 +596,7 @@ public sealed class MainForm : Form
             if (!max.Equals(row.LastMax)) { row.LastMax = max; SetSubItemText(item, 3, Units.Format(d.Quantity, max)); }
             if (!avg.Equals(row.LastAvg)) { row.LastAvg = avg; SetSubItemText(item, 4, Units.Format(d.Quantity, avg)); }
 
-            // A temperature that has been perfectly constant for a long time is almost certainly a
-            // firmware placeholder (e.g. ACPI TZ01 stuck at 50°C). Flag it once — the string work
-            // runs only on the tick it flips, so the steady state stays allocation-free.
-            if (!row.IsStaticLabeled && _ctx.Config.FlagStaticZones
-                && d.Quantity == SensorQuantity.Temperature
-                && stats is { HasData: true, Count: >= 60 } && stats.Min == stats.Max)
-            {
-                row.IsStaticLabeled = true;
-                item.Text += " " + Loc.T("main.fixed_value");
-                item.ForeColor = Theme.SubtleText;
-            }
+            UpdateStaticZoneLabel(row, d, value);
         }
 
         if (!_split.Panel2Collapsed)
@@ -635,6 +628,56 @@ public sealed class MainForm : Form
     }
 
     /// <summary>
+    /// Only ACPI thermal-zone values are candidates for firmware-placeholder labeling. A rolling
+    /// window allows a previously fixed zone to recover instead of carrying a lifetime latch.
+    /// </summary>
+    private void UpdateStaticZoneLabel(SensorRow row, SensorDescriptor descriptor, float value)
+    {
+        RingBuffer<float>? samples = row.StaticSamples;
+        if (samples is null) return;
+
+        if (!_ctx.Config.FlagStaticZones || !float.IsFinite(value))
+        {
+            samples.Clear();
+            SetStaticZoneLabel(row, descriptor, value, isStatic: false);
+            return;
+        }
+
+        samples.Add(value);
+        if (samples.Count < StaticZoneSampleCount)
+        {
+            SetStaticZoneLabel(row, descriptor, value, isStatic: false);
+            return;
+        }
+
+        float min = float.MaxValue;
+        float max = float.MinValue;
+        for (int i = 0; i < samples.Count; i++)
+        {
+            float sample = samples[i];
+            if (sample < min) min = sample;
+            if (sample > max) max = sample;
+        }
+        SetStaticZoneLabel(row, descriptor, value, max - min <= StaticZoneTolerance);
+    }
+
+    private void SetStaticZoneLabel(SensorRow row, SensorDescriptor descriptor, float value, bool isStatic)
+    {
+        if (row.IsStaticLabeled != isStatic)
+        {
+            row.IsStaticLabeled = isStatic;
+            row.Item.Text = isStatic
+                ? row.BaseText + " " + Loc.T("main.fixed_value")
+                : row.BaseText;
+        }
+
+        Color color = isStatic
+            ? Theme.SubtleText
+            : float.IsFinite(value) ? RowColorFor(descriptor.Id, value) : _list.ForeColor;
+        if (row.Item.ForeColor != color) row.Item.ForeColor = color;
+    }
+
+    /// <summary>
     /// Row handle plus the raw values last written to it, so unchanged ticks skip formatting
     /// and cell writes entirely. NaN doubles as the "no value" sentinel and matches the "—"
     /// placeholder the row is created with. Rebuilt (cache reset) by ReloadSensors.
@@ -643,15 +686,19 @@ public sealed class MainForm : Form
     {
         public readonly ListViewItem Item;
         public readonly bool IsThrottle;   // synthetic throttle state row: word cell, no min/max/avg
+        public readonly string BaseText;
+        public readonly RingBuffer<float>? StaticSamples;
         public float LastValue = float.NaN;
         public float LastMin = float.NaN;
         public float LastMax = float.NaN;
         public float LastAvg = float.NaN;
-        public bool IsStaticLabeled;   // set once when the row is flagged a firmware placeholder
-        public SensorRow(ListViewItem item, bool isThrottle)
+        public bool IsStaticLabeled;
+        public SensorRow(ListViewItem item, bool isThrottle, bool trackStaticZone)
         {
             Item = item;
             IsThrottle = isThrottle;
+            BaseText = item.Text;
+            if (trackStaticZone) StaticSamples = new RingBuffer<float>(StaticZoneSampleCount);
         }
     }
 
@@ -993,7 +1040,7 @@ public sealed class MainForm : Form
     // Exports / About
     // =========================================================================
 
-    private void ExportTimeSeriesCsv()
+    private async void ExportTimeSeriesCsv()
     {
         using var dlg = new SaveFileDialog
         {
@@ -1002,17 +1049,45 @@ public sealed class MainForm : Form
             FileName = "winmonitor-timeseries-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".csv",
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        var descriptors = new SensorDescriptor[_ctx.Sensors.Descriptors.Count];
+        for (int i = 0; i < descriptors.Length; i++)
+        {
+            SensorDescriptor source = _ctx.Sensors.Descriptors[i];
+            descriptors[i] = new SensorDescriptor
+            {
+                Id = source.Id,
+                HardwareName = source.HardwareName,
+                Name = source.Name,
+                DisplayName = source.DisplayName,
+                Category = source.Category,
+                Quantity = source.Quantity,
+            };
+        }
+
+        _exportButton.Enabled = false;
+        _exportCsvItem.Enabled = false;
         try
         {
-            // Raw values keep CSV units stable even if the display uses Fahrenheit.
-            string path = HistoryLogger.ExportTimeSeriesCsv(
-                dlg.FileName, _ctx.Sensors.Descriptors, _rawHistoryProvider);
+            // Raw values keep CSV units stable even if the display uses Fahrenheit. Disk-backed
+            // history is streamed on a worker so a long-running session cannot freeze the UI.
+            string path = await Task.Run(
+                () => _ctx.Stats.ExportTimeSeriesCsv(dlg.FileName, descriptors));
+            if (IsDisposed || Disposing) return;
             MessageBox.Show(this, Loc.F("main.export_done", path), Loc.T("app.name"),
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
-            MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+            if (!IsDisposed && !Disposing)
+                MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                _exportButton.Enabled = true;
+                _exportCsvItem.Enabled = true;
+            }
         }
     }
 
