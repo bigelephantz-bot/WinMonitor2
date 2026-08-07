@@ -303,7 +303,7 @@ static void TrayUnitFormattingTests()
         "FormatShort", BindingFlags.Static | BindingFlags.NonPublic);
     Check.True(format is not null, "Tray compact formatter should exist.");
 
-    string Format(SensorQuantity quantity, float value, bool showUnit = true)
+    string Format(SensorQuantity quantity, float value)
     {
         var descriptor = new SensorDescriptor
         {
@@ -313,66 +313,78 @@ static void TrayUnitFormattingTests()
             Category = SensorCategory.Other,
             Quantity = quantity,
         };
-        return (string)format!.Invoke(null, new object?[] { descriptor, (float?)value, showUnit })!;
+        return (string)format!.Invoke(null, new object?[] { descriptor, (float?)value })!;
     }
 
-    // Tray glyphs render at 16-24 px, so unit suffixes stay one character: the magnitude letter
-    // already carries the scale and the full unit lives in the tooltip. Multi-character suffixes
-    // ("3.4kRPM") force the fitted font down to a few pixels per glyph and become unreadable.
-    Check.Equal("3.4k", Format(SensorQuantity.Fan, 3400f), "Fan text should stay at the k suffix.");
-    Check.Equal("4.2G", Format(SensorQuantity.Frequency, 4200f), "Frequency should use the SI magnitude letter.");
-    Check.Equal("850M", Format(SensorQuantity.Frequency, 850f), "Sub-GHz frequency should use M.");
-    Check.Equal("1.2V", Format(SensorQuantity.Voltage, 1.2f), "Voltage text should include V.");
-    Check.Equal("2T", Format(SensorQuantity.Data, 2048f), "Large data values should use the T suffix.");
-    Check.Equal("65W", Format(SensorQuantity.Power, 65f), "Power keeps its single-character unit.");
-    Check.Equal("42%", Format(SensorQuantity.Load, 42f), "Load keeps its single-character unit.");
-    Check.Equal("42", Format(SensorQuantity.Load, 42f, showUnit: false),
-        "Disabling units should retain numeric-only tray text.");
+    // The tray glyph is digits only. Every character spent on a unit is taken from the number,
+    // and past three glyphs adjacent stems merge at 16 px. Magnitudes are folded into the value
+    // rather than spelled out, so no scale information is lost; the tooltip states the unit.
+    Check.Equal("34", Format(SensorQuantity.Fan, 3400f), "Fan RPM should render in hundreds.");
+    Check.Equal("900", Format(SensorQuantity.Fan, 900f), "Sub-1000 rpm stays a raw value.");
+    Check.Equal("4.2", Format(SensorQuantity.Frequency, 4200f), "Frequency should render as GHz.");
+    Check.Equal("850", Format(SensorQuantity.Frequency, 850f), "Sub-GHz frequency stays in MHz.");
+    Check.Equal("1.2", Format(SensorQuantity.Voltage, 1.2f), "Voltage drops its unit.");
+    Check.Equal("2", Format(SensorQuantity.Data, 2048f), "Large data values render as TB.");
+    Check.Equal("65", Format(SensorQuantity.Power, 65f), "Power drops its unit.");
+    Check.Equal("42", Format(SensorQuantity.Load, 42f), "Load drops its unit.");
+    Check.Equal("100", Format(SensorQuantity.Temperature, 100f), "Temperature drops its unit.");
 
-    // Sweep every quantity with a realistic reading: no glyph string may grow past the width the
-    // fitted font can still render legibly on a 16-24 px icon.
+    // Sweep each quantity across the range it can realistically report: no reading may exceed
+    // three glyphs, the most a 16 px canvas renders without adjacent stems merging.
+    var ranges = new Dictionary<SensorQuantity, float[]>
+    {
+        [SensorQuantity.Temperature] = new[] { 0f, 45f, 99.6f, 120f },
+        [SensorQuantity.Fan] = new[] { 0f, 900f, 3400f, 8000f },
+        [SensorQuantity.Frequency] = new[] { 0f, 850f, 999f, 4200f, 6000f },
+        [SensorQuantity.Power] = new[] { 0f, 65f, 250f },
+        [SensorQuantity.Load] = new[] { 0f, 42f, 100f },
+        [SensorQuantity.Level] = new[] { 0f, 42f, 100f },
+        [SensorQuantity.Control] = new[] { 0f, 42f, 100f },
+        [SensorQuantity.Voltage] = new[] { 0f, 1.25f, 12f, 20f },
+        [SensorQuantity.Data] = new[] { 0f, 512f, 999f, 1000f, 2048f, 4096f },
+    };
+
     foreach (SensorQuantity quantity in Enum.GetValues<SensorQuantity>())
     {
-        string text = Format(quantity, 85f);
-        Check.True(text.Length <= 5,
-            $"Tray glyphs must stay legible at 16-24 px; {quantity} rendered '{text}'.");
+        Check.True(ranges.ContainsKey(quantity),
+            $"{quantity} has no tray width coverage; add its realistic range.");
+        foreach (float sample in ranges[quantity])
+        {
+            string text = Format(quantity, sample);
+            Check.True(text.Length <= 3,
+                $"Tray glyphs must stay legible at 16 px; {quantity} at {sample} rendered '{text}'.");
+        }
     }
 }
 
 static void TrayIconLayoutTests()
 {
-    // A 16 px canvas cannot show 4+ glyphs on one line: adjacent stems merge into a blob. The
-    // renderer stacks the number over its unit instead, which is what makes the reading legible.
-    MethodInfo? split = typeof(IconRenderer).GetMethod(
-        "TrySplitValueUnit", BindingFlags.Static | BindingFlags.NonPublic);
-    Check.True(split is not null, "Tray value/unit split implementation should exist.");
+    // Legibility at 16 px rests on two renderer choices that are easy to "helpfully" undo:
+    // whole-pixel hinting for small glyphs, and no contrast halo. Both were settled by comparing
+    // rendered pixels — an 8-way rim composites to a near-opaque ring that closes glyph counters.
+    FieldInfo? antiAliasMin = typeof(IconRenderer).GetField(
+        "AntiAliasMinPx", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(antiAliasMin is not null,
+        "The small-glyph hinting threshold should exist; grayscale AA smears a 7 px glyph.");
+    Check.True((int)antiAliasMin!.GetRawConstantValue()! >= 10,
+        "The hinting threshold must cover the sizes a 16 px canvas actually produces.");
 
-    (bool Stacked, string Value, string Unit) Split(string text)
-    {
-        object?[] args = { text, null, null };
-        bool stacked = (bool)split!.Invoke(null, args)!;
-        return (stacked, (string)args[1]!, (string)args[2]!);
-    }
+    MethodInfo? hint = typeof(IconRenderer).GetMethod(
+        "ApplyHintFor", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(hint is not null, "Per-size hint selection should exist.");
 
-    var temp = Split("45°C");
-    Check.True(temp.Stacked, "A value with a unit should stack once it exceeds three glyphs.");
-    Check.Equal("45", temp.Value, "Stacking should keep the digits together.");
-    Check.Equal("°C", temp.Unit, "Stacking should peel off the whole trailing unit.");
+    // The halo field is gone; its return would reintroduce the mud this replaced.
+    FieldInfo? halo = typeof(IconRenderer).GetField(
+        "HaloColor", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(halo is null,
+        "No contrast halo: it closed glyph counters and hurt legibility on both taskbar shades.");
 
-    var wide = Split("100°C");
-    Check.True(wide.Stacked, "Five glyphs must stack.");
-    Check.Equal("100", wide.Value, "Three-digit readings stay intact.");
-
-    var fan = Split("3.4k");
-    Check.True(fan.Stacked, "Fan readings should stack.");
-    Check.Equal("3.4", fan.Value, "A decimal point belongs to the value, not the unit.");
-    Check.Equal("k", fan.Unit, "The magnitude letter is the unit.");
-
-    // Short strings already render large; splitting them would only shrink the number.
-    Check.True(!Split("72").Stacked, "Two glyphs already fit and must not stack.");
-    Check.True(!Split("100").Stacked, "A bare three-digit value must not stack.");
-    Check.True(!Split("OK").Stacked, "State words have no unit to peel off.");
-    Check.True(!Split("HOT").Stacked, "State words must keep the full canvas.");
+    // Icons must render at the shell's small-icon size so the taskbar shows the pixels 1:1.
+    FieldInfo? canvas = typeof(IconRenderer).GetField(
+        "CanvasSize", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(canvas is not null, "Canvas size should be derived from the shell metric.");
+    int size = (int)canvas!.GetValue(null)!;
+    Check.True(size >= 16 && size <= 64, $"Canvas size {size} is outside the plausible range.");
 }
 
 static void EcSensorComputeTests()

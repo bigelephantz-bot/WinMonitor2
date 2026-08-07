@@ -82,6 +82,14 @@ public sealed partial class SettingsForm : Form
         Theme.ApplyTitleBar(this);
     }
 
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        // After layout, before the first paint: the tab strip now reports a real height, and
+        // resizing here is invisible to the user.
+        FitTabsToContent();
+    }
+
     private void OnOk(object? sender, EventArgs e)
     {
         if (ApplyOwnSettings())
@@ -313,6 +321,8 @@ public sealed partial class SettingsForm : Form
             _lastLocalization = Loc.Current;
             _lastDarkTheme = Theme.IsDark;
             _tabs.SelectedIndex = Math.Min(selectedIndex, _tabs.TabCount - 1);
+            // Label widths change with the language, so the fit has to be recomputed.
+            FitTabsToContent();
         }
         finally { _loading = previousLoading; }
         LoadAllTabs();
@@ -471,10 +481,62 @@ public sealed partial class SettingsForm : Form
 
     private static TabPage NewTabPage(string text)
     {
-        var page = new TabPage(text);
+        var page = new TabPage(text)
+        {
+            // Most tabs lay controls out at absolute coordinates sized for English at 100 % DPI.
+            // Longer zh-TW labels or a larger system font push content past the client area, and
+            // without scrolling those controls become unreachable no matter how the user resizes.
+            // FitTabsToContent below sizes the window to fit; AutoScroll is the guarantee that
+            // nothing is ever stranded when it cannot (small screen, high DPI, user shrinks it).
+            AutoScroll = true,
+        };
         // Only override in dark mode; light mode keeps the visual-style tab background.
         if (Theme.IsDark) page.BackColor = Theme.WindowBack;
         return page;
+    }
+
+    /// <summary>
+    /// Grows the window so the busiest tab fits without scrolling, then clamps to the working
+    /// area and re-centres. Measured from the real controls rather than hard-coded, so a
+    /// translated label, a larger system font or per-monitor DPI widens the window instead of
+    /// pushing controls out of reach.
+    ///
+    /// Runs from OnLoad: before that the tab strip has not been laid out, so its height (and the
+    /// chrome derived from it) would be wrong.
+    /// </summary>
+    private void FitTabsToContent()
+    {
+        int contentW = 0, contentH = 0;
+        foreach (TabPage page in _tabs.TabPages)
+        {
+            foreach (Control child in page.Controls)
+            {
+                // Docked children stretch to whatever they are given, so they say nothing about
+                // the space actually required; only absolutely placed controls define the extent.
+                if (child.Dock != DockStyle.None) continue;
+                contentW = Math.Max(contentW, child.Right + child.Margin.Right);
+                contentH = Math.Max(contentH, child.Bottom + child.Margin.Bottom);
+            }
+        }
+        if (contentW == 0 && contentH == 0) return;   // every tab is docked; defaults are fine
+
+        const int pagePadding = 20;                    // page inset + a little breathing room
+        Size border = Size - ClientSize;               // window frame; valid before the first show
+        int tabStrip = Math.Max(24, _tabs.ItemSize.Height + 6);
+
+        int width = contentW + pagePadding + border.Width;
+        int height = contentH + pagePadding + border.Height + tabStrip + _bottomPanel.Height;
+
+        Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+        width = Math.Clamp(width, MinimumSize.Width, workingArea.Width);
+        height = Math.Clamp(height, MinimumSize.Height, workingArea.Height);
+        if (width <= Width && height <= Height) return;   // already large enough
+
+        Size = new Size(Math.Max(width, Width), Math.Max(height, Height));
+        Location = new Point(
+            workingArea.X + Math.Max(0, (workingArea.Width - Width) / 2),
+            workingArea.Y + Math.Max(0, (workingArea.Height - Height) / 2));
+        Diag.Log("ui", $"Settings sized to {Width}x{Height} for {contentW}x{contentH} of content");
     }
 
     /// <summary>Adds delayed hover help and the same text for accessibility clients.</summary>
