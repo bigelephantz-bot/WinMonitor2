@@ -17,10 +17,11 @@ namespace WinMonitor.Tray;
 /// The size is computed once and cached: taskbar DPI changes are rare and a stale size
 /// until restart is an accepted trade-off.
 ///
-/// Legibility at 16 px is dominated by two choices, both settled by rendering the candidates
+/// Legibility at 16 px is dominated by three choices, all settled by rendering the candidates
 /// and comparing pixels rather than by theory: glyphs below <see cref="AntiAliasMinPx"/> are
-/// drawn with whole-pixel hinting instead of grayscale AA, and no contrast halo is drawn at
-/// all. See the comments at those sites for why.
+/// drawn with whole-pixel hinting instead of grayscale AA, no contrast halo is drawn at all,
+/// and callers pass digits only — a unit suffix costs glyphs the number cannot spare. See the
+/// comments at those sites, and TrayIconManager.FormatShort, for why.
 /// </summary>
 public static class IconRenderer
 {
@@ -54,16 +55,11 @@ public static class IconRenderer
     // uses AA for short strings and still falls back to crisp for cramped 4-glyph ones.
     private const int AntiAliasMinPx = 13;
 
-    // Share of the canvas height given to the number when a value/unit pair is stacked; the
-    // remainder carries the unit. Weighted toward the number: it is what the user reads.
-    private const float ValueBandFraction = 0.70f;
-
     // Caches live for the process lifetime; guarded by _gate (renders happen on the UI
     // thread, but locking makes the class safe from any caller).
     private static readonly object _gate = new();
     private static readonly Dictionary<int, Font> _fontCache = new();        // key: px<<1 | bold
     private static readonly Dictionary<int, int> _fittedPxCache = new();     // key: (bucket<<2) | (spark<<1) | bold -> font px
-    private static readonly Dictionary<int, int> _stackedPxCache = new();    // stacked layout fits
     private static readonly Dictionary<int, SolidBrush> _brushCache = new(); // key: ARGB
     private static readonly Dictionary<int, Pen> _penCache = new();          // key: ARGB (sparkline line pens)
     private static readonly StringFormat _centerFormat = CreateCenterFormat();
@@ -138,16 +134,9 @@ public static class IconRenderer
                     // counters of 0/4/6/8/9 and fills the gaps between strokes — glyphs turn to mud
                     // on BOTH light and dark taskbars. Saturated state colors carry the contrast;
                     // verified by rendering both variants over each taskbar shade.
-                    if (!spark && TrySplitValueUnit(text, out string value, out string unit))
-                    {
-                        DrawValueOverUnit(g, value, unit, bold, fill);
-                    }
-                    else
-                    {
-                        Font font = PickFont(g, text, bold, spark);
-                        ApplyHintFor(g, font);
-                        g.DrawString(text, font, fill, new RectangleF(0f, 0f, CanvasSize, textHeight), _centerFormat);
-                    }
+                    Font font = PickFont(g, text, bold, spark);
+                    ApplyHintFor(g, font);
+                    g.DrawString(text, font, fill, new RectangleF(0f, 0f, CanvasSize, textHeight), _centerFormat);
 
                     if (spark) DrawSparkline(g, history, lineColor);
                 }
@@ -170,75 +159,6 @@ public static class IconRenderer
         => g.TextRenderingHint = font.Size < AntiAliasMinPx
             ? TextRenderingHint.SingleBitPerPixelGridFit
             : TextRenderingHint.AntiAliasGridFit;
-
-    /// <summary>
-    /// Splits a rendered value into its numeric part and trailing unit ("45°C" → "45"/"°C",
-    /// "3.4k" → "3.4"/"k") when stacking them would gain real size, and returns false when the
-    /// string should stay on one line.
-    ///
-    /// The whole canvas is 16 px at 100 % DPI. Four or more glyphs on one line leaves ~3 px each
-    /// and adjacent stems merge into a blob — the very complaint this addresses. Stacking gives
-    /// the number the full width and ~70 % of the height, so "100" renders at roughly three times
-    /// the area it had inline. Short strings ("72", "OK", "HOT") already render large and are left
-    /// alone, as are purely alphabetic state words, which have no unit to peel off.
-    /// </summary>
-    private static bool TrySplitValueUnit(string text, out string value, out string unit)
-    {
-        value = text;
-        unit = string.Empty;
-        if (text.Length < 4) return false;   // already legible inline
-
-        int i = text.Length;
-        while (i > 0 && !char.IsDigit(text[i - 1])) i--;
-        if (i == 0 || i == text.Length) return false;   // no digits, or no trailing unit
-
-        value = text[..i];
-        unit = text[i..];
-        return true;
-    }
-
-    /// <summary>
-    /// Stacked layout: the number across the full width in the upper band, the unit centered
-    /// underneath. Each part is fitted and hinted independently so the number gets the largest
-    /// size its band allows.
-    /// </summary>
-    private static void DrawValueOverUnit(Graphics g, string value, string unit, bool bold, SolidBrush fill)
-    {
-        float valueBand = CanvasSize * ValueBandFraction;
-        float unitBand = CanvasSize - valueBand;
-
-        Font valueFont = FitFontFor(g, value, CanvasSize, valueBand, bold);
-        ApplyHintFor(g, valueFont);
-        g.DrawString(value, valueFont, fill, new RectangleF(0f, 0f, CanvasSize, valueBand), _centerFormat);
-
-        Font unitFont = FitFontFor(g, unit, CanvasSize, unitBand + 1f, bold);
-        ApplyHintFor(g, unitFont);
-        g.DrawString(unit, unitFont, fill, new RectangleF(0f, valueBand, CanvasSize, unitBand), _centerFormat);
-    }
-
-    /// <summary>
-    /// Largest cached font whose measured box fits the given bounds. Results are cached per
-    /// (text length, bounds, bold) so the binary search is a cold path only.
-    /// </summary>
-    private static Font FitFontFor(Graphics g, string text, float maxWidth, float maxHeight, bool bold)
-    {
-        int key = (text.Length << 18) | ((int)maxHeight << 9) | ((int)maxWidth << 1) | (bold ? 1 : 0);
-        if (!_stackedPxCache.TryGetValue(key, out int px))
-        {
-            FontStyle style = bold ? FontStyle.Bold : _baseStyle;
-            int lo = MinFontPx, hi = CanvasSize * 2;
-            while (lo < hi)
-            {
-                int mid = lo + (hi - lo + 1) / 2;
-                using var probe = new Font(_textFamily, mid, style, GraphicsUnit.Pixel);
-                SizeF m = g.MeasureString(text, probe, PointF.Empty, _centerFormat);
-                if (m.Width <= maxWidth && m.Height <= maxHeight) lo = mid; else hi = mid - 1;
-            }
-            px = lo;
-            _stackedPxCache[key] = px;
-        }
-        return GetFont(px, bold);
-    }
 
     /// <summary>
     /// Draws an auto-scaled anti-aliased polyline across the bottom band. Caller guarantees

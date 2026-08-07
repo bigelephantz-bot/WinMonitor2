@@ -16,7 +16,7 @@ public sealed partial class SettingsForm
     private readonly List<string> _traySensorListIds = new();   // parallel to _clbTraySensors items
     private NumericUpDown _numRotate = null!;
     private ComboBox _cboStyle = null!;
-    private CheckBox _chkShowUnit = null!, _chkBold = null!, _chkSparkline = null!;
+    private CheckBox _chkBold = null!, _chkSparkline = null!;
     private RadioButton _rbThresholdColors = null!, _rbFixedColor = null!;
     private Button _btnPickColor = null!;
 
@@ -101,12 +101,10 @@ public sealed partial class SettingsForm
         SetOptionToolTip("tip.tray.style", lblStyle, _cboStyle);
         page.Controls.Add(_cboStyle);
 
-        _chkShowUnit = NewCheck(Loc.T("set.tray.show_unit"), 280, 322);
-        _chkShowUnit.CheckedChanged += (_, _) => { if (!_loading && SelectedTrayIcon is { } c) c.ShowUnit = _chkShowUnit.Checked; };
-        SetOptionToolTip("tip.tray.show_unit", _chkShowUnit);
-        page.Controls.Add(_chkShowUnit);
-
-        _chkBold = NewCheck(Loc.T("set.tray.bold"), 470, 322);
+        // No "show unit" checkbox: the tray glyph is digits only. At 16 px a unit suffix costs
+        // glyphs the number cannot spare, so units are shown in the tooltip and main window
+        // instead. TrayIconConfig.ShowUnit is kept for config compatibility but is unused.
+        _chkBold = NewCheck(Loc.T("set.tray.bold"), 280, 322);
         _chkBold.CheckedChanged += (_, _) => { if (!_loading && SelectedTrayIcon is { } c) c.Bold = _chkBold.Checked; };
         SetOptionToolTip("tip.tray.bold", _chkBold);
         page.Controls.Add(_chkBold);
@@ -246,7 +244,6 @@ public sealed partial class SettingsForm
         bool has = cfg is not null;
         _clbTraySensors.Enabled = has;
         _cboStyle.Enabled = has;
-        _chkShowUnit.Enabled = has;
         _chkBold.Enabled = has;
         _chkSparkline.Enabled = has;
         _rbThresholdColors.Enabled = has;
@@ -268,7 +265,6 @@ public sealed partial class SettingsForm
             }
             _numRotate.Value = Math.Clamp(cfg.RotateIntervalSec, 1, 60);
             _cboStyle.SelectedIndex = cfg.Style == TrayIconStyle.TextOnBadge ? 1 : 0;
-            _chkShowUnit.Checked = cfg.ShowUnit;
             _chkBold.Checked = cfg.Bold;
             _chkSparkline.Checked = cfg.ShowSparkline;
             bool fixedColor = !string.IsNullOrEmpty(cfg.ColorOverride);

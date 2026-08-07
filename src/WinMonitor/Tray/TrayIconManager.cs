@@ -357,7 +357,7 @@ public sealed class TrayIconManager : IDisposable
         if (id is not null && _latest.TryGetValue(id, out var latest) && latest is { } v && !float.IsNaN(v))
             value = v;
 
-        string text = FormatShort(descriptor, value, slot.Cfg.ShowUnit);
+        string text = FormatShort(descriptor, value);
         Color state = ResolveStateColor(slot, descriptor, value);
         TrayIconStyle style = slot.Cfg.Style;
 
@@ -500,13 +500,18 @@ public sealed class TrayIconManager : IDisposable
         => a is { } av ? b is { } bv && SameFloat(av, bv) : b is null;
 
     /// <summary>
-    /// Renders the value for a tray glyph. A tray icon is 16–24 px, so IconRenderer shrinks the
-    /// font to whatever fits: at ~24 px a 7-glyph string like "3.4kRPM" leaves roughly 3 px per
-    /// character and is unreadable. Unit suffixes are therefore kept to ONE character — the
-    /// magnitude letter already carries the scale ("3.4k" RPM, "2.4G" Hz) — and the full,
-    /// unambiguous unit lives in the tooltip, which has room for it.
+    /// Renders the value for a tray glyph: DIGITS ONLY, never a unit.
+    ///
+    /// A tray icon is 16 px at 100 % DPI. Every glyph spent on a unit is taken from the number,
+    /// and past three glyphs adjacent stems merge into an unreadable blob — so the icon shows the
+    /// bare reading at the largest size that fits, and the unit lives in the tooltip and the main
+    /// window, which have room to be unambiguous.
+    ///
+    /// Magnitudes are folded into the number instead of being spelled out, so no scale
+    /// information is lost: fan RPM is shown in hundreds ("34" = 3400 rpm) and frequency in GHz
+    /// ("4.2" = 4200 MHz). Both are stated exactly in the tooltip.
     /// </summary>
-    private static string FormatShort(SensorDescriptor? descriptor, float? value, bool showUnit)
+    private static string FormatShort(SensorDescriptor? descriptor, float? value)
     {
         if (descriptor is null || value is not { } v) return "—";
         // Synthetic throttle sensor: language-neutral state word instead of a number.
@@ -515,56 +520,37 @@ public sealed class TrayIconManager : IDisposable
         switch (descriptor.Quantity)
         {
             case SensorQuantity.Temperature:
-            {
-                // "°C"/"°F" is two glyphs but the degree sign is narrow and the value is at most
-                // three digits, so this stays inside the legible budget.
-                string t = Units.FormatTempShort(v);
-                return showUnit ? t + Units.TempSuffix : t;
-            }
+                return Units.FormatTempShort(v);
+
             case SensorQuantity.Fan:
-                // "3.4k" already means thousands of RPM; a trailing "RPM" would triple the width.
+                // Hundreds of RPM keeps a four-digit reading inside two glyphs ("34" = 3400).
+                // Below 1000 rpm the raw value is already short enough to show as-is.
                 return v >= 1000f
-                    ? (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture) + "k"
+                    ? ((int)MathF.Round(v / 100f)).ToString(CultureInfo.InvariantCulture)
                     : ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
+
             case SensorQuantity.Level:
             case SensorQuantity.Load:
             case SensorQuantity.Control:
-            {
-                string p = ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
-                return showUnit ? p + "%" : p;
-            }
             case SensorQuantity.Power:
-            {
-                string w = ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
-                return showUnit ? w + "W" : w;
-            }
+                return ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
+
             case SensorQuantity.Frequency:
-            {
-                // Frequencies arrive in MHz. The SI magnitude letter is the unit here: "2.4G"
-                // reads as GHz at a glance, where "2.4GHz" would not read at all.
-                if (v >= 1000f)
-                {
-                    string ghz = (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture);
-                    return showUnit ? ghz + "G" : ghz;
-                }
-                string mhz = MathF.Round(v).ToString(CultureInfo.InvariantCulture);
-                return showUnit ? mhz + "M" : mhz;
-            }
+                // Frequencies arrive in MHz; GHz with one decimal fits three glyphs.
+                return v >= 1000f
+                    ? (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture)
+                    : MathF.Round(v).ToString(CultureInfo.InvariantCulture);
+
             case SensorQuantity.Voltage:
-            {
-                string voltage = v.ToString("0.#", CultureInfo.InvariantCulture);
-                return showUnit ? voltage + "V" : voltage;
-            }
+                return v.ToString("0.#", CultureInfo.InvariantCulture);
+
             case SensorQuantity.Data:
-            {
-                if (v >= 1024f)
-                {
-                    string tb = (v / 1024f).ToString("0.#", CultureInfo.InvariantCulture);
-                    return showUnit ? tb + "T" : tb;
-                }
-                string gb = v.ToString("0.#", CultureInfo.InvariantCulture);
-                return showUnit ? gb + "G" : gb;
-            }
+                // Switch to TB at 1000 GB, not 1024: the 1000-1023 GB band would otherwise need
+                // four digits, one more than the canvas can render legibly.
+                return v >= 1000f
+                    ? (v / 1024f).ToString("0.#", CultureInfo.InvariantCulture)
+                    : ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
+
             default:
                 return v.ToString("0.#", CultureInfo.InvariantCulture);
         }
