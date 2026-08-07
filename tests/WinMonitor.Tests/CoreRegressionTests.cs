@@ -17,6 +17,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(CsvExportTests), CsvExportTests),
     (nameof(TrayUnitFormattingTests), TrayUnitFormattingTests),
     (nameof(IntelThermalStatusDecodeTests), IntelThermalStatusDecodeTests),
+    (nameof(TrayIconLayoutTests), TrayIconLayoutTests),
     (nameof(EcSensorComputeTests), EcSensorComputeTests),
     (nameof(ConfigMigrationTests), ConfigMigrationTests),
 };
@@ -336,6 +337,42 @@ static void TrayUnitFormattingTests()
         Check.True(text.Length <= 5,
             $"Tray glyphs must stay legible at 16-24 px; {quantity} rendered '{text}'.");
     }
+}
+
+static void TrayIconLayoutTests()
+{
+    // A 16 px canvas cannot show 4+ glyphs on one line: adjacent stems merge into a blob. The
+    // renderer stacks the number over its unit instead, which is what makes the reading legible.
+    MethodInfo? split = typeof(IconRenderer).GetMethod(
+        "TrySplitValueUnit", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(split is not null, "Tray value/unit split implementation should exist.");
+
+    (bool Stacked, string Value, string Unit) Split(string text)
+    {
+        object?[] args = { text, null, null };
+        bool stacked = (bool)split!.Invoke(null, args)!;
+        return (stacked, (string)args[1]!, (string)args[2]!);
+    }
+
+    var temp = Split("45°C");
+    Check.True(temp.Stacked, "A value with a unit should stack once it exceeds three glyphs.");
+    Check.Equal("45", temp.Value, "Stacking should keep the digits together.");
+    Check.Equal("°C", temp.Unit, "Stacking should peel off the whole trailing unit.");
+
+    var wide = Split("100°C");
+    Check.True(wide.Stacked, "Five glyphs must stack.");
+    Check.Equal("100", wide.Value, "Three-digit readings stay intact.");
+
+    var fan = Split("3.4k");
+    Check.True(fan.Stacked, "Fan readings should stack.");
+    Check.Equal("3.4", fan.Value, "A decimal point belongs to the value, not the unit.");
+    Check.Equal("k", fan.Unit, "The magnitude letter is the unit.");
+
+    // Short strings already render large; splitting them would only shrink the number.
+    Check.True(!Split("72").Stacked, "Two glyphs already fit and must not stack.");
+    Check.True(!Split("100").Stacked, "A bare three-digit value must not stack.");
+    Check.True(!Split("OK").Stacked, "State words have no unit to peel off.");
+    Check.True(!Split("HOT").Stacked, "State words must keep the full canvas.");
 }
 
 static void EcSensorComputeTests()
