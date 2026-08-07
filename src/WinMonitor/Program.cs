@@ -40,10 +40,17 @@ internal static class Program
             Thread.Sleep(TimeSpan.FromSeconds(delaySeconds));
 
         AppConfig config = ConfigStore.Load();
+        Diag.Initialize(ConfigStore.ConfigDirectory);
+        Diag.Log("app", "Start (portable=" + ConfigStore.IsPortable
+            + ", minimized=" + minimized + ", delay=" + delaySeconds + "s)");
         Loc.Initialize(config.Language);
         Theme.Initialize(config.ThemeMode);
         Units.UseFahrenheit = config.UseFahrenheit;
         if (config.StartMinimized) minimized = true;
+
+        // Reclaim session spools abandoned by runs that did not exit cleanly (force-kill, crash,
+        // power loss). Off the startup path: it only touches files older than several hours.
+        ThreadPool.QueueUserWorkItem(_ => SessionHistoryStore.SweepOrphans());
 
         Application.ThreadException += (_, e) => LogCrash(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => LogCrash(e.ExceptionObject as Exception);
@@ -117,6 +124,10 @@ public sealed class WinMonitorContext : ApplicationContext
     // Auto peak reset (item 15): 1-minute schedule check + a guard so one target minute
     // never triggers twice. -1 = never auto-reset this session.
     private readonly System.Windows.Forms.Timer _peakResetTimer;
+
+    // Drives one full hardware sweep per background-logging interval so smart polling can stay
+    // on while logging (see SyncLoggingSweepTimer). Null whenever logging is disabled.
+    private System.Windows.Forms.Timer? _loggingSweepTimer;
     private long _lastAutoPeakResetTick = -1;
 
     // Throttle-indicator enabled state at the last ApplySettings. When it flips, the descriptor
@@ -359,11 +370,10 @@ public sealed class WinMonitorContext : ApplicationContext
         bool windowVisible = (_mainForm is { IsDisposed: false, Visible: true } && _mainForm.WindowState != FormWindowState.Minimized)
                           || (_compactForm is { IsDisposed: false, Visible: true })
                           || (_settingsForm is { IsDisposed: false, Visible: true });
-        // Background CSV promises a complete row at its configured interval. Smart polling must
-        // therefore keep every descriptor active while logging, even with all windows hidden.
-        if (windowVisible || Config.Logging.Enabled)
+        if (windowVisible)
         {
             Sensors.SetActiveSensorIds(null);
+            SyncLoggingSweepTimer();
             return;
         }
 
@@ -383,6 +393,47 @@ public sealed class WinMonitorContext : ApplicationContext
         foreach (var d in Sensors.Descriptors)
             if (Config.ResolveThresholds(d).AlertEnabled) ids.Add(d.Id);
         Sensors.SetActiveSensorIds(ids);
+        SyncLoggingSweepTimer();
+    }
+
+    /// <summary>
+    /// Keeps the logging sweep timer in step with the current configuration.
+    ///
+    /// Background CSV promises a complete row at its configured interval, but that interval
+    /// (30 s by default) is much longer than the poll interval. Forcing every descriptor to stay
+    /// active would sweep all hardware — including SSD SMART, which wakes the drive — on every
+    /// tick for the whole session, which is exactly the battery cost smart polling exists to
+    /// avoid. Requesting one full sweep per logging interval keeps rows complete while leaving
+    /// the intervening ticks on the smart-polled set.
+    /// </summary>
+    private void SyncLoggingSweepTimer()
+    {
+        bool wanted = Config.Logging.Enabled;
+        if (!wanted)
+        {
+            if (_loggingSweepTimer is { } stop)
+            {
+                stop.Stop();
+                stop.Dispose();
+                _loggingSweepTimer = null;
+            }
+            return;
+        }
+
+        // Sweep slightly ahead of the writer so the values it records are freshly swept.
+        int intervalMs = Math.Max(1, Config.Logging.IntervalSeconds) * 1000;
+        intervalMs = Math.Max(1000, intervalMs - 500);
+
+        if (_loggingSweepTimer is { } timer)
+        {
+            if (timer.Interval != intervalMs) timer.Interval = intervalMs;
+            timer.Start();
+            return;
+        }
+
+        _loggingSweepTimer = new System.Windows.Forms.Timer { Interval = intervalMs };
+        _loggingSweepTimer.Tick += (_, _) => Sensors.RequestFullSweep();
+        _loggingSweepTimer.Start();
     }
 
     // ---------- windows ----------
@@ -712,6 +763,9 @@ public sealed class WinMonitorContext : ApplicationContext
 
     private void OnPowerModeChanged(object sender, Microsoft.Win32.PowerModeChangedEventArgs e)
     {
+        // Logged unconditionally: a hard-to-reproduce post-sleep fault is only diagnosable if the
+        // suspend/resume boundary itself is on record alongside the rescan that follows it.
+        Diag.Log("power", e.Mode + " (line=" + SystemInformation.PowerStatus.PowerLineStatus + ")");
         switch (e.Mode)
         {
             case Microsoft.Win32.PowerModes.StatusChange:
@@ -741,10 +795,22 @@ public sealed class WinMonitorContext : ApplicationContext
     public void ExitApp()
     {
         if (_exiting) return;
+
+        // A CSV export runs on a worker thread; ExitThread would kill it mid-write and leave a
+        // silently truncated file. Let the user finish or knowingly abandon it.
+        if (_mainForm is { IsDisposed: false } mf && mf.IsExportInProgress)
+        {
+            var answer = MessageBox.Show(mf, Loc.T("main.export_busy"), Loc.T("app.name"),
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes) return;
+            Diag.Log("app", "Exit requested while a CSV export was still running; file may be truncated");
+        }
+
         // If a settings dialog is still open, close it first so its OnFormClosing revert runs;
         // otherwise the ConfigStore.Save below would persist edits the user never committed.
         if (_settingsForm is { IsDisposed: false } sf) { try { sf.Close(); } catch { } }
         _exiting = true;
+        Diag.Log("app", "Shutting down");
         UnhookSessionEnding();
         UnhookPowerMode();
         CleanupOwnedResources();
@@ -818,6 +884,7 @@ public sealed class WinMonitorContext : ApplicationContext
         TryCleanup(Sensors.Stop);
         TryCleanup(_peakResetTimer.Stop);
         TryCleanup(_peakResetTimer.Dispose);
+        TryCleanup(() => { _loggingSweepTimer?.Stop(); _loggingSweepTimer?.Dispose(); _loggingSweepTimer = null; });
         TryCleanup(_sync.UnregisterCompactHotkey);
         TryCleanup(() => _flyout?.Dispose());
         TryCleanup(Tray.Dispose);

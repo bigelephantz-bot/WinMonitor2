@@ -90,6 +90,8 @@ public static class Loc
         ["main.help"] = "Help",
         ["main.about"] = "About",
         ["main.export_done"] = "Exported to {0}",
+        ["main.export_truncated"] = "Note: the session history reached its size cap, so the newest samples are missing from this file.",
+        ["main.export_busy"] = "A CSV export is still running. Exiting now will leave a truncated file.\r\n\r\nExit anyway?",
         ["mem.no_sensor"] = "Most consumer memory modules have no dedicated temperature sensor.",
         ["main.no_fans"] = "No fan sensors detected. Many laptops (including LG gram) hide fan control behind a proprietary EC that exposes no standard interface.",
         ["main.confirm_close.title"] = "Close WinMonitor",
@@ -208,6 +210,11 @@ public static class Loc
         ["set.diag.never"] = "Never",
         ["set.diag.none"] = "None",
         ["set.diag.milliseconds"] = "ms",
+        ["set.diag.history_size"] = "Session history spool",
+        ["set.diag.history_truncated"] = "(cap reached — newest samples are not exported)",
+        ["set.diag.open_log"] = "Open diagnostic log",
+        ["set.diag.no_log"] = "No diagnostic log has been written yet.",
+        ["set.diag.ec_explorer"] = "EC register explorer…",
 
         // Settings tooltips
         ["tip.tabs"] = "Choose a category of settings. Hover an individual option for a detailed explanation.",
@@ -219,6 +226,8 @@ public static class Loc
         ["tip.tab.diagnostics"] = "Inspect live sensor-polling health and copy details for troubleshooting.",
         ["tip.diagnostics.hint"] = "Shows the latest polling result, failures, backend availability, and timing. No settings are changed here.",
         ["tip.diagnostics.copy"] = "Copies the current diagnostic report to the clipboard for a support request or issue report.",
+        ["tip.diagnostics.open_log"] = "Opens the rolling diagnostic log. Unlike this page it survives sleep, crashes and restarts, so it is the place to look for a fault that already happened.",
+        ["tip.diagnostics.ec_explorer"] = "Opens the Embedded Controller register explorer used to discover fan registers on laptop models that have no built-in mapping.",
         ["tip.common.apply"] = "Save changes made in this dialog and keep the Settings window open.",
         ["tip.common.cancel"] = "Discard changes made since the last Apply, or since this window was opened.",
         ["tip.common.ok"] = "Save changes and close the Settings window.",
@@ -468,6 +477,8 @@ public static class Loc
         ["main.help"] = "說明",
         ["main.about"] = "關於",
         ["main.export_done"] = "已匯出至 {0}",
+        ["main.export_truncated"] = "注意：工作階段歷史已達容量上限，最新的取樣未包含在此檔案中。",
+        ["main.export_busy"] = "CSV 匯出仍在進行中。現在結束會留下不完整的檔案。\r\n\r\n仍要結束嗎？",
         ["mem.no_sensor"] = "多數消費級記憶體模組沒有獨立的溫度感測器。",
         ["main.no_fans"] = "未偵測到風扇感測器。許多筆電（包含 LG gram）的風扇由專屬 EC 控制，未提供標準讀取介面。",
         ["main.confirm_close.title"] = "關閉 WinMonitor",
@@ -586,6 +597,11 @@ public static class Loc
         ["set.diag.never"] = "尚未發生",
         ["set.diag.none"] = "無",
         ["set.diag.milliseconds"] = "毫秒",
+        ["set.diag.history_size"] = "工作階段歷史暫存",
+        ["set.diag.history_truncated"] = "（已達上限——最新的取樣不會出現在匯出中）",
+        ["set.diag.open_log"] = "開啟診斷記錄",
+        ["set.diag.no_log"] = "尚未寫入任何診斷記錄。",
+        ["set.diag.ec_explorer"] = "EC 暫存器探索器…",
 
         // Settings tooltips
         ["tip.tabs"] = "選擇設定類別；將滑鼠停在個別選項上可查看詳細說明。",
@@ -597,6 +613,8 @@ public static class Loc
         ["tip.tab.diagnostics"] = "查看即時感測器輪詢健康狀態，並可複製資訊以利排除問題。",
         ["tip.diagnostics.hint"] = "顯示最近輪詢結果、失敗、後端可用性與耗時；此處不會變更任何設定。",
         ["tip.diagnostics.copy"] = "將目前診斷報告複製到剪貼簿，方便附在支援請求或問題回報中。",
+        ["tip.diagnostics.open_log"] = "開啟輪替式診斷記錄。與此頁面不同，它會跨越睡眠、當機與重新啟動保留下來，是查明「已經發生過」的問題的地方。",
+        ["tip.diagnostics.ec_explorer"] = "開啟嵌入式控制器暫存器探索器，用於在沒有內建對應表的筆電機型上找出風扇暫存器。",
         ["tip.common.apply"] = "儲存目前變更並保持「設定」視窗開啟。",
         ["tip.common.cancel"] = "放棄自上次套用後或開啟此視窗後所做的變更。",
         ["tip.common.ok"] = "儲存變更並關閉「設定」視窗。",
@@ -672,6 +690,9 @@ public static class Loc
         ["tip.profiles.rename"] = "只變更選取設定檔的名稱，不會改變其設定內容。",
         ["tip.profiles.delete"] = "確認後刪除選取設定檔；最後保留的一個設定檔無法刪除。",
         ["tip.profiles.name"] = "輸入非空白且不與既有設定檔重複的名稱。",
+
+        // Language-neutral, but present in both dictionaries so the coverage audit stays clean.
+        ["set.alert.browse"] = "…",
 
         // Battery extra
         ["bat.charge"] = "電量",

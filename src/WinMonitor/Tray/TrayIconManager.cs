@@ -499,6 +499,13 @@ public sealed class TrayIconManager : IDisposable
     private static bool FloatsEqual(float? a, float? b)
         => a is { } av ? b is { } bv && SameFloat(av, bv) : b is null;
 
+    /// <summary>
+    /// Renders the value for a tray glyph. A tray icon is 16–24 px, so IconRenderer shrinks the
+    /// font to whatever fits: at ~24 px a 7-glyph string like "3.4kRPM" leaves roughly 3 px per
+    /// character and is unreadable. Unit suffixes are therefore kept to ONE character — the
+    /// magnitude letter already carries the scale ("3.4k" RPM, "2.4G" Hz) — and the full,
+    /// unambiguous unit lives in the tooltip, which has room for it.
+    /// </summary>
     private static string FormatShort(SensorDescriptor? descriptor, float? value, bool showUnit)
     {
         if (descriptor is null || value is not { } v) return "—";
@@ -509,15 +516,16 @@ public sealed class TrayIconManager : IDisposable
         {
             case SensorQuantity.Temperature:
             {
+                // "°C"/"°F" is two glyphs but the degree sign is narrow and the value is at most
+                // three digits, so this stays inside the legible budget.
                 string t = Units.FormatTempShort(v);
                 return showUnit ? t + Units.TempSuffix : t;
             }
             case SensorQuantity.Fan:
-                // "3.4k" for 3400 RPM keeps it to 4 glyphs; tooltip carries the exact RPM.
-                string rpm = v >= 1000f
+                // "3.4k" already means thousands of RPM; a trailing "RPM" would triple the width.
+                return v >= 1000f
                     ? (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture) + "k"
                     : ((int)MathF.Round(v)).ToString(CultureInfo.InvariantCulture);
-                return showUnit ? rpm + "RPM" : rpm;
             case SensorQuantity.Level:
             case SensorQuantity.Load:
             case SensorQuantity.Control:
@@ -532,14 +540,15 @@ public sealed class TrayIconManager : IDisposable
             }
             case SensorQuantity.Frequency:
             {
-                // Frequencies arrive in MHz; use the canonical unit rather than an ambiguous G.
+                // Frequencies arrive in MHz. The SI magnitude letter is the unit here: "2.4G"
+                // reads as GHz at a glance, where "2.4GHz" would not read at all.
                 if (v >= 1000f)
                 {
                     string ghz = (v / 1000f).ToString("0.0", CultureInfo.InvariantCulture);
-                    return showUnit ? ghz + "GHz" : ghz;
+                    return showUnit ? ghz + "G" : ghz;
                 }
                 string mhz = MathF.Round(v).ToString(CultureInfo.InvariantCulture);
-                return showUnit ? mhz + "MHz" : mhz;
+                return showUnit ? mhz + "M" : mhz;
             }
             case SensorQuantity.Voltage:
             {
@@ -551,10 +560,10 @@ public sealed class TrayIconManager : IDisposable
                 if (v >= 1024f)
                 {
                     string tb = (v / 1024f).ToString("0.#", CultureInfo.InvariantCulture);
-                    return showUnit ? tb + "TB" : tb;
+                    return showUnit ? tb + "T" : tb;
                 }
                 string gb = v.ToString("0.#", CultureInfo.InvariantCulture);
-                return showUnit ? gb + "GB" : gb;
+                return showUnit ? gb + "G" : gb;
             }
             default:
                 return v.ToString("0.#", CultureInfo.InvariantCulture);

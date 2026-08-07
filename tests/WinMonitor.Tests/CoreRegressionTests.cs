@@ -1,4 +1,7 @@
 using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using WinMonitor.Config;
 using WinMonitor.Core;
 using WinMonitor.Tray;
@@ -14,6 +17,8 @@ var tests = new (string Name, Action Run)[]
     (nameof(CsvExportTests), CsvExportTests),
     (nameof(TrayUnitFormattingTests), TrayUnitFormattingTests),
     (nameof(IntelThermalStatusDecodeTests), IntelThermalStatusDecodeTests),
+    (nameof(EcSensorComputeTests), EcSensorComputeTests),
+    (nameof(ConfigMigrationTests), ConfigMigrationTests),
 };
 
 int failures = 0;
@@ -310,12 +315,143 @@ static void TrayUnitFormattingTests()
         return (string)format!.Invoke(null, new object?[] { descriptor, (float?)value, showUnit })!;
     }
 
-    Check.Equal("3.4kRPM", Format(SensorQuantity.Fan, 3400f), "Fan text should include RPM.");
-    Check.Equal("4.2GHz", Format(SensorQuantity.Frequency, 4200f), "Frequency text should include GHz.");
+    // Tray glyphs render at 16-24 px, so unit suffixes stay one character: the magnitude letter
+    // already carries the scale and the full unit lives in the tooltip. Multi-character suffixes
+    // ("3.4kRPM") force the fitted font down to a few pixels per glyph and become unreadable.
+    Check.Equal("3.4k", Format(SensorQuantity.Fan, 3400f), "Fan text should stay at the k suffix.");
+    Check.Equal("4.2G", Format(SensorQuantity.Frequency, 4200f), "Frequency should use the SI magnitude letter.");
+    Check.Equal("850M", Format(SensorQuantity.Frequency, 850f), "Sub-GHz frequency should use M.");
     Check.Equal("1.2V", Format(SensorQuantity.Voltage, 1.2f), "Voltage text should include V.");
-    Check.Equal("2TB", Format(SensorQuantity.Data, 2048f), "Large data values should include TB.");
+    Check.Equal("2T", Format(SensorQuantity.Data, 2048f), "Large data values should use the T suffix.");
+    Check.Equal("65W", Format(SensorQuantity.Power, 65f), "Power keeps its single-character unit.");
+    Check.Equal("42%", Format(SensorQuantity.Load, 42f), "Load keeps its single-character unit.");
     Check.Equal("42", Format(SensorQuantity.Load, 42f, showUnit: false),
         "Disabling units should retain numeric-only tray text.");
+
+    // Sweep every quantity with a realistic reading: no glyph string may grow past the width the
+    // fitted font can still render legibly on a 16-24 px icon.
+    foreach (SensorQuantity quantity in Enum.GetValues<SensorQuantity>())
+    {
+        string text = Format(quantity, 85f);
+        Check.True(text.Length <= 5,
+            $"Tray glyphs must stay legible at 16-24 px; {quantity} rendered '{text}'.");
+    }
+}
+
+static void EcSensorComputeTests()
+{
+    var regs = new byte[256];
+    var ok = new bool[256];
+
+    // 0xB0/0xB1 is the LG 16T90R fan pair: DSDT RPM1/RPM2, little-endian direct RPM.
+    regs[0xB0] = 0x48;
+    regs[0xB1] = 0x0D;   // LE16 = 0x0D48 = 3400
+    ok[0xB0] = true;
+    ok[0xB1] = true;
+
+    EcSensorDef Def(EcValueKind kind, int register = 0xB0) => new()
+    {
+        Register = register,
+        Kind = kind,
+        Name = "Fan",
+        Quantity = SensorQuantity.Fan,
+    };
+
+    Check.Equal(3400f, Def(EcValueKind.RpmDirect).Compute(regs, ok) ?? -1f,
+        "Little-endian word assembly should read the DSDT fan pair as RPM.");
+
+    var bigEndian = Def(EcValueKind.RpmDirect);
+    bigEndian.BigEndian = true;
+    Check.Equal(18445f, bigEndian.Compute(regs, ok) ?? -1f,      // 0x480D
+        "Big-endian mode must swap the byte order.");
+
+    Check.Equal(72f, Def(EcValueKind.RawByte).Compute(regs, ok) ?? -1f,   // 0x48
+        "RawByte should read the low register only.");
+
+    var scaled = Def(EcValueKind.RawByte);
+    scaled.Scale = 100f;
+    scaled.Offset = 5f;
+    Check.Equal(7205f, scaled.Compute(regs, ok) ?? -1f,          // 72 * 100 + 5
+        "Scale and offset should apply to raw bytes.");
+
+    // A stopped fan reports a zero period; dividing by it must not produce infinity.
+    var stopped = new byte[256];
+    var stoppedOk = new bool[256];
+    stoppedOk[0xB0] = true;
+    stoppedOk[0xB1] = true;
+    var divided = Def(EcValueKind.RpmDivided);
+    divided.Divisor = 1_000_000f;
+    Check.Equal(0f, divided.Compute(stopped, stoppedOk) ?? -1f,
+        "A zero period must read as a stopped fan, never infinity.");
+    Check.True(float.IsFinite(divided.Compute(regs, ok) ?? float.NaN),
+        "A live period must produce a finite RPM.");
+
+    // A register the EC could not read this tick must surface as null, never a stale zero.
+    var partial = new bool[256];
+    partial[0xB0] = true;   // high byte missing
+    Check.True(Def(EcValueKind.RpmDirect).Compute(regs, partial) is null,
+        "A word sensor missing its high byte must return null.");
+    Check.True(Def(EcValueKind.RawByte).Compute(regs, new bool[256]) is null,
+        "An unread register must return null.");
+
+    // The last register has no successor, so word kinds cannot be satisfied there.
+    var lastOk = new bool[256];
+    lastOk[0xFF] = true;
+    Check.True(Def(EcValueKind.RpmDirect, 0xFF).Compute(regs, lastOk) is null,
+        "A word sensor at register 0xFF has no high byte and must return null.");
+}
+
+static void ConfigMigrationTests()
+{
+    MethodInfo? migrate = typeof(ConfigStore).GetMethod(
+        "Migrate", BindingFlags.Static | BindingFlags.NonPublic);
+    MethodInfo? readVersion = typeof(ConfigStore).GetMethod(
+        "ReadSchemaVersion", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(migrate is not null, "Config migration implementation should exist.");
+    Check.True(readVersion is not null, "Schema version reader should exist.");
+
+    int Version(JsonObject root) => (int)readVersion!.Invoke(null, new object[] { root })!;
+
+    Check.Equal(1, Version(new JsonObject()),
+        "A document without SchemaVersion is a v1 document.");
+    Check.Equal(1, Version(new JsonObject { ["SchemaVersion"] = "four" }),
+        "A non-numeric SchemaVersion must not be trusted.");
+    Check.Equal(1, Version(new JsonObject { ["SchemaVersion"] = 0 }),
+        "A SchemaVersion below 1 must not be trusted.");
+    Check.Equal(3, Version(new JsonObject { ["SchemaVersion"] = 3 }),
+        "A valid SchemaVersion should be read as-is.");
+
+    // Walk the whole chain the way Load does: every step must run without throwing and must
+    // leave a document the typed contract can still deserialize. This is the guard that keeps a
+    // future migration from silently wiping settings for users upgrading from an older build.
+    var legacy = new JsonObject
+    {
+        ["SchemaVersion"] = 1,
+        ["PollIntervalMs"] = 2000,
+        ["Language"] = "zh-TW",
+        ["UseFahrenheit"] = true,
+    };
+
+    int version = Version(legacy);
+    int steps = 0;
+    while (version < 4)
+    {
+        migrate!.Invoke(null, new object[] { legacy, version });
+        version++;
+        legacy["SchemaVersion"] = version;
+        Check.True(++steps <= 16, "Migration chain should terminate.");
+    }
+
+    Check.Equal(4, Version(legacy), "The chain should land on the current schema version.");
+
+    AppConfig? migrated = legacy.Deserialize<AppConfig>(new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,
+        Converters = { new JsonStringEnumConverter() },
+    });
+    Check.True(migrated is not null, "A migrated document must still deserialize.");
+    Check.Equal("zh-TW", migrated!.Language, "Migration must preserve user settings it does not reshape.");
+    Check.True(migrated.UseFahrenheit, "Migration must preserve unrelated user settings.");
 }
 
 static void HistoryLayoutFingerprintTests()

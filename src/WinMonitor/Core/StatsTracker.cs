@@ -20,15 +20,17 @@ public sealed class StatsTracker : IDisposable
     private sealed class Entry
     {
         public readonly SessionStats Stats = new();
-        public readonly RingBuffer<TimedValue> History;
+
+        /// <summary>
+        /// Bounded chart/sparkline ring, allocated only once a consumer actually asks for this
+        /// sensor's history. At the default 3600-sample capacity each ring costs ~57 KB, so
+        /// arming every discovered sensor eagerly would spend several MB on curves nobody plots.
+        /// CSV export does not need it — the complete series lives in the disk spool.
+        /// </summary>
+        public RingBuffer<TimedValue>? History;
         public long HistoryVersion;
         public float LatestValue;
         public bool HasLatest;
-
-        public Entry(int historyCapacity)
-        {
-            History = new RingBuffer<TimedValue>(historyCapacity);
-        }
     }
 
     private readonly object _gate = new();
@@ -56,7 +58,7 @@ public sealed class StatsTracker : IDisposable
                 if (!_entries.TryGetValue(s.Id, out var entry))
                 {
                     if (_entries.Count >= MaxTrackedSensors) continue;
-                    entry = new Entry(_historyCapacity);
+                    entry = new Entry();
                     _entries[s.Id] = entry;
                 }
 
@@ -64,8 +66,12 @@ public sealed class StatsTracker : IDisposable
                 entry.Stats.Accept(v);
                 entry.LatestValue = v;
                 entry.HasLatest = true;
-                entry.History.Add(new TimedValue(s.UtcTimestamp, v));
-                entry.HistoryVersion++;
+                // Only feed a ring that some consumer armed; unplotted sensors stay stats-only.
+                if (entry.History is { } ring)
+                {
+                    ring.Add(new TimedValue(s.UtcTimestamp, v));
+                    entry.HistoryVersion++;
+                }
                 _sessionHistory.Append(s.Id, s.UtcTimestamp, v);
             }
         }
@@ -95,8 +101,13 @@ public sealed class StatsTracker : IDisposable
     }
 
     /// <summary>
-    /// Copied snapshot (oldest first) of every sample recorded during this application run.
-    /// Used by time-series CSV export; unlike the chart ring, it is populated for all sensors.
+    /// Copied snapshot (oldest first) of every sample recorded for ONE sensor during this run.
+    /// Unlike the chart ring this covers all sensors, because it reads the disk spool.
+    ///
+    /// COST: O(entire session), because the spool interleaves all sensors and must be scanned
+    /// end to end to filter one of them. Intended for single-sensor inspection and tests only —
+    /// never call it per descriptor in a loop; use <see cref="ExportTimeSeriesCsv"/>, which walks
+    /// the spool exactly once for every column.
     /// </summary>
     public IReadOnlyList<TimedValue> GetHistory(string sensorId)
     {
@@ -122,6 +133,21 @@ public sealed class StatsTracker : IDisposable
         }
     }
 
+    /// <summary>
+    /// True once the session spool reached its size cap: statistics stay live, but a CSV export
+    /// no longer contains the newest samples. Surfaced in the Diagnostics tab.
+    /// </summary>
+    public bool SessionHistoryTruncated
+    {
+        get { lock (_gate) return _sessionHistory.Truncated; }
+    }
+
+    /// <summary>Bytes appended to the session spool so far (diagnostics only).</summary>
+    public long SessionHistoryBytes
+    {
+        get { lock (_gate) return _sessionHistory.BytesWritten; }
+    }
+
     /// <summary>Streams a stable session snapshot to CSV without materializing all histories.</summary>
     public string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors)
     {
@@ -142,17 +168,19 @@ public sealed class StatsTracker : IDisposable
     /// </summary>
     public HistoryReadResult GetHistoryIfChanged(string sensorId, long knownVersion)
     {
+        EnsureHistoryArmed(sensorId);
         lock (_gate)
         {
             Entry? entry = GetOrCreateEntryLocked(sensorId);
             if (entry is null)
                 return new HistoryReadResult(-1, Array.Empty<TimedValue>());
 
+            RingBuffer<TimedValue>? ring = entry.History;
             if (entry.HistoryVersion == knownVersion)
                 return new HistoryReadResult(entry.HistoryVersion, null);
 
-            TimedValue[] values = entry.History.Count > 0
-                ? entry.History.ToArray()
+            TimedValue[] values = ring is { Count: > 0 }
+                ? ring.ToArray()
                 : Array.Empty<TimedValue>();
             return new HistoryReadResult(entry.HistoryVersion, values);
         }
@@ -167,11 +195,11 @@ public sealed class StatsTracker : IDisposable
     {
         if (dest.Length == 0 || max <= 0) return 0;
         int want = Math.Min(max, dest.Length);
+        EnsureHistoryArmed(sensorId);
         lock (_gate)
         {
             Entry? entry = GetOrCreateEntryLocked(sensorId);
-            if (entry is null) return 0;
-            RingBuffer<TimedValue> h = entry.History;
+            if (entry is null || entry.History is not { } h) return 0;
             int n = Math.Min(want, h.Count);
             int start = h.Count - n;
             for (int i = 0; i < n; i++)
@@ -187,9 +215,79 @@ public sealed class StatsTracker : IDisposable
     {
         if (_entries.TryGetValue(sensorId, out var entry)) return entry;
         if (_entries.Count >= MaxTrackedSensors) return null;
-        entry = new Entry(_historyCapacity);
+        entry = new Entry();
         _entries[sensorId] = entry;
         return entry;
+    }
+
+    /// <summary>
+    /// Allocates this sensor's chart ring the first time a consumer asks for its history, and
+    /// backfills it from the disk spool so a chart opened mid-session still shows what already
+    /// happened instead of starting blank.
+    ///
+    /// Laziness is what keeps memory down: at the default capacity every armed ring costs ~57 KB,
+    /// so arming all ~90 discovered sensors would spend several MB on curves nobody plots. The
+    /// backfill scan is O(session) but runs at most once per sensor, triggered by a user action
+    /// (ticking a chart box), and deliberately happens OUTSIDE <see cref="_gate"/> so it can never
+    /// stall the polling thread. Samples that arrive during the scan are appended afterwards, so
+    /// the ring stays in chronological order.
+    /// </summary>
+    private void EnsureHistoryArmed(string sensorId)
+    {
+        SessionHistoryReadSnapshot snapshot;
+        lock (_gate)
+        {
+            if (_disposed) return;
+            Entry? entry = GetOrCreateEntryLocked(sensorId);
+            if (entry is null || entry.History is not null) return;
+
+            // Publish the ring before releasing the lock: Accept starts filling it immediately,
+            // and a concurrent EnsureHistoryArmed sees it as armed and skips a duplicate scan.
+            entry.History = new RingBuffer<TimedValue>(_historyCapacity);
+            snapshot = _sessionHistory.Capture();
+        }
+
+        var backfill = new List<TimedValue>();
+        try
+        {
+            using (snapshot)
+            {
+                int sensorIndex = Array.IndexOf(snapshot.SensorIds, sensorId);
+                if (sensorIndex >= 0)
+                {
+                    foreach (SessionHistoryRecord record in snapshot.ReadRecords())
+                    {
+                        if (record.SensorIndex != sensorIndex) continue;
+                        // Keep only the newest capacity worth; the ring would discard the rest.
+                        if (backfill.Count == _historyCapacity) backfill.RemoveAt(0);
+                        backfill.Add(new TimedValue(new DateTime(record.UtcTicks, DateTimeKind.Utc), record.Value));
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // An unreadable spool only costs the backfill; the ring still fills going forward.
+            Diag.Log("history", "Chart history backfill failed for " + sensorId, ex);
+            return;
+        }
+
+        if (backfill.Count == 0) return;
+
+        lock (_gate)
+        {
+            if (_disposed) return;
+            if (!_entries.TryGetValue(sensorId, out Entry? entry) || entry.History is not { } live) return;
+
+            // Rebuild as backfill (older) followed by whatever arrived during the scan, so the
+            // ring's ordering contract holds and overflow still drops the oldest samples.
+            TimedValue[] arrivedDuringScan = live.ToArray();
+            var rebuilt = new RingBuffer<TimedValue>(_historyCapacity);
+            for (int i = 0; i < backfill.Count; i++) rebuilt.Add(backfill[i]);
+            for (int i = 0; i < arrivedDuringScan.Length; i++) rebuilt.Add(arrivedDuringScan[i]);
+            entry.History = rebuilt;
+            entry.HistoryVersion++;
+        }
     }
 
     /// <summary>
@@ -203,7 +301,9 @@ public sealed class StatsTracker : IDisposable
             foreach (var entry in _entries.Values)
             {
                 entry.Stats.Reset();
-                entry.History.Clear();
+                // Armed rings are emptied, not released: a chart that is currently plotting this
+                // sensor keeps its buffer and simply restarts from the next sample.
+                entry.History?.Clear();
                 entry.HistoryVersion++;
             }
         }
