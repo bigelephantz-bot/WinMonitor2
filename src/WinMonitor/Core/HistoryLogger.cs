@@ -155,69 +155,10 @@ public sealed class HistoryLogger : IDisposable
 
     // ---------- one-shot exports (exceptions propagate to the caller) ----------
 
-    /// <summary>
-    /// Exports every sample retained since application start as a wide time series: one row per
-    /// polling timestamp and one column per sensor. Missing/off-cadence readings remain empty.
-    /// </summary>
-    public static string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
-        Func<string, IReadOnlyList<TimedValue>> historyProvider)
-    {
-        var histories = new IReadOnlyList<TimedValue>[descriptors.Count];
-        var timestampSet = new HashSet<long>();
-        for (int i = 0; i < descriptors.Count; i++)
-        {
-            IReadOnlyList<TimedValue> history = historyProvider(descriptors[i].Id)
-                ?? Array.Empty<TimedValue>();
-            histories[i] = history;
-            for (int j = 0; j < history.Count; j++)
-                timestampSet.Add(history[j].Utc.Ticks);
-        }
-
-        long[] timestamps = timestampSet.ToArray();
-        Array.Sort(timestamps);
-        var cursors = new int[descriptors.Count];
-        using var writer = new StreamWriter(path, append: false, Utf8Bom);
-
-        var sb = new StringBuilder(Math.Max(256, descriptors.Count * 40));
-        sb.Append("Timestamp");
-        for (int i = 0; i < descriptors.Count; i++)
-        {
-            sb.Append(',');
-            AppendCsvField(sb, ExportColumnName(descriptors[i]));
-        }
-        writer.WriteLine(sb.ToString());
-
-        for (int rowIndex = 0; rowIndex < timestamps.Length; rowIndex++)
-        {
-            long timestamp = timestamps[rowIndex];
-            sb.Clear();
-            sb.Append(new DateTime(timestamp, DateTimeKind.Utc).ToLocalTime()
-                .ToString("yyyy-MM-dd'T'HH:mm:ss.fffzzz", CultureInfo.InvariantCulture));
-
-            for (int sensorIndex = 0; sensorIndex < descriptors.Count; sensorIndex++)
-            {
-                sb.Append(',');
-                IReadOnlyList<TimedValue> history = histories[sensorIndex];
-                int cursor = cursors[sensorIndex];
-                while (cursor < history.Count && history[cursor].Utc.Ticks < timestamp)
-                    cursor++;
-                if (cursor < history.Count && history[cursor].Utc.Ticks == timestamp)
-                {
-                    float value = history[cursor].Value;
-                    if (string.Equals(descriptors[sensorIndex].Id, WellKnown.ThrottleSensorId,
-                                      StringComparison.Ordinal))
-                        sb.Append(value >= 0.5f ? "True" : "False");
-                    else
-                        sb.Append(value.ToString(CultureInfo.InvariantCulture));
-                    cursor++;
-                }
-                cursors[sensorIndex] = cursor;
-            }
-            writer.WriteLine(sb.ToString());
-        }
-        writer.Flush();
-        return path;
-    }
+    // A provider-based overload used to live here, materializing every sensor's full session
+    // history in memory before writing. The disk-spool snapshot below replaced it: memory now
+    // scales with descriptor count instead of session duration, so the old path was removed
+    // rather than left as a same-named trap for callers reaching for the obvious overload.
 
     /// <summary>
     /// Streams a disk-backed session snapshot as a wide time series. Memory use depends only on

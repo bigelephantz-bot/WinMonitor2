@@ -50,6 +50,7 @@ public sealed class SensorService : IDisposable
     private int _intervalMs;
     private int _polling;                    // Interlocked reentrancy guard
     private volatile bool _rescanRequested;  // consumed on the polling thread
+    private volatile bool _fullSweepRequested; // one-shot full sweep (background logging cadence)
     private volatile bool _wmiDiscoveryPending; // startup deferred WMI zone discovery; consumed on the polling thread
     private bool _skipNextUpdate;            // first tick after Start(): node values are fresh from RebuildDescriptors
     private bool _disposed;
@@ -270,6 +271,21 @@ public sealed class SensorService : IDisposable
     }
 
     /// <summary>
+    /// Forces the next tick to sweep every hardware node, then resumes the configured smart-polling
+    /// set. Background CSV logging uses this to guarantee a complete row on its own (much slower)
+    /// cadence without having to disable smart polling for the whole session — the difference
+    /// between one full sweep every logging interval and one on every poll tick.
+    /// </summary>
+    public void RequestFullSweep(bool wakeNow = false)
+    {
+        _fullSweepRequested = true;
+        if (wakeNow)
+        {
+            try { _wakeEvent.Set(); } catch (ObjectDisposedException) { }
+        }
+    }
+
+    /// <summary>
     /// Requests a descriptor-only rebuild on the polling thread (no LHM reopen). Used when a
     /// config toggle changes the synthetic descriptor set (e.g. the CPU throttle indicator).
     /// </summary>
@@ -400,7 +416,12 @@ public sealed class SensorService : IDisposable
             }
 
             long now = Environment.TickCount64;
-            bool full = activeEntries is null || _lastFullTickMs == 0 || now - _lastFullTickMs >= FullRefreshMs;
+            // A requested sweep is consumed exactly once, so logging pays for one full tick per
+            // logging interval instead of forcing every tick to sweep all hardware.
+            bool sweepRequested = _fullSweepRequested;
+            if (sweepRequested) _fullSweepRequested = false;
+            bool full = sweepRequested || activeEntries is null
+                     || _lastFullTickMs == 0 || now - _lastFullTickMs >= FullRefreshMs;
 
             IHardware[] nodes = full ? allNodes : activeNodes!;
             bool[] nodesSlow = full ? allNodesSlow : activeNodesSlow!;
@@ -568,7 +589,10 @@ public sealed class SensorService : IDisposable
 
     private void DoRescan()
     {
-        try { _computer?.Close(); } catch { }
+        int before = _descriptors.Count;
+        Diag.Log("sensors", "Hardware rescan starting (descriptors=" + before + ")");
+
+        try { _computer?.Close(); } catch (Exception ex) { Diag.Log("sensors", "Computer.Close failed", ex); }
         _computer = null;
 
         // Dispose can race a rescan (Stop's Join has a timeout). Never reopen a Computer
@@ -580,7 +604,7 @@ public sealed class SensorService : IDisposable
         try { _intelThermalStatus?.Dispose(); } catch { }
         _intelThermalStatus = null;
         _intelThermalStatusInitializationAttempted = false;
-        try { _ec.Reset(); } catch { }
+        try { _ec.Reset(); } catch (Exception ex) { Diag.Log("ec", "Reset failed", ex); }
 
         OpenComputer();
         if (IsShuttingDown())
@@ -592,6 +616,8 @@ public sealed class SensorService : IDisposable
 
         RebuildDescriptors();
         _lastFullTickMs = 0; // force a full tick right after the rescan
+        Diag.Log("sensors", "Hardware rescan complete (descriptors=" + _descriptors.Count
+            + ", was " + before + ", ec=" + (_ec.Available ? "available" : _ec.UnavailableReason ?? "off") + ")");
         DescriptorsChanged?.Invoke();
     }
 
@@ -689,11 +715,13 @@ public sealed class SensorService : IDisposable
         {
             full.Open();
             _computer = full;
+            Diag.Log("backend", "Opened full hardware set (elevated=" + IsElevated + ")");
             return;
         }
-        catch
+        catch (Exception ex)
         {
             try { full.Close(); } catch { }
+            Diag.Log("backend", "Full hardware set failed; retrying essentials", ex);
         }
 
         // A GPU/controller backend can fail independently of the CPU. Retry with the useful
@@ -710,11 +738,13 @@ public sealed class SensorService : IDisposable
         {
             essentials.Open();
             _computer = essentials;
+            Diag.Log("backend", "DEGRADED: essentials only (no GPU/motherboard/controller sensors)");
             return;
         }
-        catch
+        catch (Exception ex)
         {
             try { essentials.Close(); } catch { }
+            Diag.Log("backend", "Essentials set failed; retrying driver-free sources", ex);
         }
 
         // PawnIO/kernel access can still be unavailable; retain driver-free sources rather than
@@ -729,11 +759,13 @@ public sealed class SensorService : IDisposable
         {
             reduced.Open();
             _computer = reduced;
+            Diag.Log("backend", "DEGRADED: driver-free sources only (no CPU telemetry)");
         }
-        catch
+        catch (Exception ex)
         {
             try { reduced.Close(); } catch { }
             _computer = null; // WMI-thermal-zone-only mode; never crash the app
+            Diag.Log("backend", "DEGRADED: no LHM backend; WMI thermal zones only", ex);
         }
     }
 

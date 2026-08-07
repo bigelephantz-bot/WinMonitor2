@@ -1040,6 +1040,12 @@ public sealed class MainForm : Form
     // Exports / About
     // =========================================================================
 
+    /// <summary>
+    /// True while a CSV export worker is running. Shutdown checks this: ExitThread would kill the
+    /// worker mid-write and leave a truncated file with no indication anything went wrong.
+    /// </summary>
+    public bool IsExportInProgress { get; private set; }
+
     private async void ExportTimeSeriesCsv()
     {
         using var dlg = new SaveFileDialog
@@ -1066,6 +1072,7 @@ public sealed class MainForm : Form
 
         _exportButton.Enabled = false;
         _exportCsvItem.Enabled = false;
+        IsExportInProgress = true;
         try
         {
             // Raw values keep CSV units stable even if the display uses Fahrenheit. Disk-backed
@@ -1073,16 +1080,21 @@ public sealed class MainForm : Form
             string path = await Task.Run(
                 () => _ctx.Stats.ExportTimeSeriesCsv(dlg.FileName, descriptors));
             if (IsDisposed || Disposing) return;
-            MessageBox.Show(this, Loc.F("main.export_done", path), Loc.T("app.name"),
+            string message = Loc.F("main.export_done", path);
+            if (_ctx.Stats.SessionHistoryTruncated)
+                message += Environment.NewLine + Environment.NewLine + Loc.T("main.export_truncated");
+            MessageBox.Show(this, message, Loc.T("app.name"),
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
+            Diag.Log("export", "Time-series CSV export failed", ex);
             if (!IsDisposed && !Disposing)
                 MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
+            IsExportInProgress = false;
             if (!IsDisposed && !Disposing)
             {
                 _exportButton.Enabled = true;

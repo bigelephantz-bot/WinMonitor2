@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using WinMonitor.Core;
@@ -53,16 +54,47 @@ public sealed partial class SettingsForm
         {
             Text = Loc.T("set.diag.copy"),
             AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new Padding(0, 10, 0, 0),
+            Margin = new Padding(0, 10, 8, 0),
         };
         copy.Click += (_, _) => CopyDiagnostics();
 
+        var openLog = new Button
+        {
+            Text = Loc.T("set.diag.open_log"),
+            AutoSize = true,
+            Margin = new Padding(0, 10, 8, 0),
+        };
+        openLog.Click += (_, _) => OpenDiagnosticLog();
+
+        // The EC register explorer has no other entry point since the LG 16T90R fan map became a
+        // built-in default. It stays reachable here because every other machine still needs it.
+        var ecExplorer = new Button
+        {
+            Text = Loc.T("set.diag.ec_explorer"),
+            AutoSize = true,
+            Margin = new Padding(0, 10, 0, 0),
+        };
+        ecExplorer.Click += (_, _) => OpenEcExplorer();
+
+        var actions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = new Padding(0),
+        };
+        actions.Controls.Add(copy);
+        actions.Controls.Add(openLog);
+        actions.Controls.Add(ecExplorer);
+
         SetOptionToolTip("tip.diagnostics.hint", hint, _diagnosticsText);
         SetOptionToolTip("tip.diagnostics.copy", copy);
+        SetOptionToolTip("tip.diagnostics.open_log", openLog);
+        SetOptionToolTip("tip.diagnostics.ec_explorer", ecExplorer);
         layout.Controls.Add(hint, 0, 0);
         layout.Controls.Add(_diagnosticsText, 0, 1);
-        layout.Controls.Add(copy, 0, 2);
+        layout.Controls.Add(actions, 0, 2);
         page.Controls.Add(layout);
 
         EnsureDiagnosticsTimer();
@@ -124,7 +156,15 @@ public sealed partial class SettingsForm
         sb.Append(Loc.T("set.diag.pawnio")).Append(": ")
             .Append(_ctx.Sensors.PawnIoDetected
                 ? _ctx.Sensors.PawnIoVersion?.ToString() ?? Loc.T("set.diag.available")
-                : Loc.T("set.diag.unavailable"));
+                : Loc.T("set.diag.unavailable")).AppendLine();
+
+        // Session spool: an export silently missing its newest rows is otherwise invisible.
+        long spoolBytes = _ctx.Stats.SessionHistoryBytes;
+        sb.Append(Loc.T("set.diag.history_size")).Append(": ")
+            .Append((spoolBytes / (1024.0 * 1024.0)).ToString("N1", CultureInfo.CurrentCulture))
+            .Append(" MB");
+        if (_ctx.Stats.SessionHistoryTruncated)
+            sb.Append("  ").Append(Loc.T("set.diag.history_truncated"));
 
         string text = sb.ToString();
         if (!string.Equals(_diagnosticsText.Text, text, StringComparison.Ordinal))
@@ -141,5 +181,44 @@ public sealed partial class SettingsForm
         if (_diagnosticsText is null || _diagnosticsText.TextLength == 0) return;
         try { Clipboard.SetText(_diagnosticsText.Text); }
         catch { /* Clipboard can be temporarily unavailable in a remote session. */ }
+    }
+
+    /// <summary>Opens the rolling breadcrumb log — the record that survives sleep and crashes.</summary>
+    private void OpenDiagnosticLog()
+    {
+        string? path = Diag.LogPath;
+        if (path is null || !File.Exists(path))
+        {
+            MessageBox.Show(this, Loc.T("set.diag.no_log"), Loc.T("app.name"),
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try
+        {
+            Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OpenEcExplorer()
+    {
+        try
+        {
+            using var form = new EcExplorerForm(
+                _ctx.Sensors.Ec,
+                _ctx.Config.Ec,
+                () => _ctx.Sensors.RefreshEcSensors(_ctx.Config.Ec),
+                () => (_ctx.Stats.GetLatestValue(SensorPicker.PickAuto(_ctx.Sensors.Descriptors) ?? "") ?? float.NaN,
+                       float.NaN));
+            form.ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            Diag.Log("ec", "EC explorer failed to open", ex);
+            MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 }

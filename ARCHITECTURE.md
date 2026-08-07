@@ -24,7 +24,8 @@ SensorService (bg thread, LHM Computer)  --SnapshotUpdated event-->
 
 ## Key types (already written — read these files first)
 - `Core/Models.cs` — `SensorCategory`, `SensorQuantity`, `SensorDescriptor`, `SensorSnapshot`, `SessionStats`, `Units`, `RingBuffer<T>`.
-- `Core/SessionHistoryStore.cs` — append-only temporary-file spool used to preserve full-session CSV history with bounded process memory.
+- `Core/SessionHistoryStore.cs` — append-only temporary-file spool used to preserve full-session CSV history with bounded process memory. Growth is capped (256 MB, then `Truncated`) and `SweepOrphans()` reclaims spools left by runs that did not exit cleanly. Its exporter groups one CSV row per distinct timestamp, which relies on every sensor in a poll tick sharing that tick's timestamp.
+- `Core/Diag.cs` — size-capped rolling breadcrumb log (`winmonitor.log` beside config, one rolled generation). Records lifecycle/degradation events the deliberate empty catches would otherwise hide: backend tier fallbacks, EC reset, rescans, suspend/resume. Never throws.
 - `Config/AppConfig.cs` — full JSON config schema: `AppConfig`, `Profile`, `TrayIconConfig`, `Thresholds`, `SensorOverride`, `LoggingConfig`. `ConfigStore` (in ConfigStore.cs) persists it.
 - `Localization/Loc.cs` — `Loc.T(key)`, `Loc.Current` ("en" / "zh-TW"), falls back to the key itself, then en.
 - `Program.cs` — composition root; shows how everything is wired. `WinMonitorContext` owns all services and the hidden `SyncWindow` used for marshaling + TaskbarCreated re-registration.
@@ -43,6 +44,7 @@ public sealed class SensorService : IDisposable
     public event Action? DescriptorsChanged;
     public void SetPollInterval(int ms);
     public void SetActiveSensorIds(IReadOnlyCollection<string>? ids); // smart polling: null = update all hardware; otherwise only hardware nodes containing these ids + a full refresh every 30s
+    public void RequestFullSweep(bool wakeNow = false); // one-shot full sweep; background logging uses it to keep rows complete without disabling smart polling
     public void RescanHardware();
     public bool IsElevated { get; }            // admin check result
     public bool PawnIoDetected { get; }        // informational, registry/driver check
@@ -71,6 +73,8 @@ public sealed class StatsTracker : IDisposable
 public readonly record struct TimedValue(DateTime Utc, float Value);
 ```
 Track every valid sensor sample so a time-series export contains the complete application run. Keep complete history in an append-only temporary spool and chart history in bounded rings. Thread-safe (lock per call is fine).
+
+Chart rings are **lazily armed**: a ring is allocated only when some consumer first asks for that sensor's history (chart tick, tray sparkline), because at the default capacity each ring costs ~57 KB and most discovered sensors are never plotted. Arming backfills the ring from the disk spool — off the lock, once per sensor — so a chart opened mid-session still shows what already happened rather than starting blank. `GetHistory(id)` is O(entire session) by nature (it filters one sensor out of an interleaved spool); never call it per descriptor in a loop, use `ExportTimeSeriesCsv`, which walks the spool once for all columns.
 
 ### Core/AlertEngine.cs
 ```csharp
@@ -121,7 +125,7 @@ public sealed class TrayIconManager : IDisposable
 }
 ```
 - One NotifyIcon per `TrayIconConfig`. Multi-sensor configs rotate on a UI-thread WinForms Timer (`RotateIntervalSec`).
-- Text: temp → integer value (no unit unless ShowUnit; °F conversion honored); fan → RPM/100 rounded (e.g. "34" for 3400) with tooltip clarifying, or "5.2k"-style — pick integer hundreds "x100" only if >999 RPM, else raw. Keep glyphs ≤3 chars for legibility.
+- Text: temp → integer value (no unit unless ShowUnit; °F conversion honored); fan → "3.4k"-style for ≥1000 RPM, else raw. **Unit suffixes are one character** ("W", "%", "V", "G"/"M" for frequency, "G"/"T" for data; "°C"/"°F" is the narrow exception) — a tray glyph is 16–24 px, so a multi-character suffix like "3.4kRPM" shrinks the fitted font to a few pixels per glyph. Full units belong in the tooltip. A regression check enforces the width budget.
 - Color: from threshold state (green/yellow/red from resolved Thresholds) unless ColorOverride. Background transparent by default; `Style` may be TextOnly | TextOnBadge.
 - Tooltip (63-char NotifyIcon.Text limit): "Name 45°C (min 38 / max 72)" trimmed to fit. Right-click ContextMenuStrip: Open, Settings, Compact mode, Reset peaks, Open log folder, Task Manager (`taskmgr.exe`), Exit. Only redraw an icon when its rendered text or color actually changed.
 
