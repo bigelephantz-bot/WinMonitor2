@@ -65,7 +65,10 @@ foreach (var group in svc.Descriptors.GroupBy(d => d.Category).OrderBy(g => g.Ke
         string value = string.Equals(d.Id, WellKnown.ThrottleSensorId, StringComparison.Ordinal)
             ? v is { } state && !float.IsNaN(state) ? (state >= 0.5f ? "True" : "False") : "—"
             : Units.Format(d.Quantity, v);
-        Console.WriteLine($"  [{d.Quantity,-11}] {d.HardwareName} / {d.Name,-28} = {value}   ({d.Id})");
+        // Print the resolved display name, not the raw one: that is what the UI shows, including
+        // the quantity suffix added when one hardware reuses a name across quantities.
+        string shown = config.DisplayNameFor(d);
+        Console.WriteLine($"  [{d.Quantity,-11}] {d.HardwareName} / {shown,-34} = {value}   ({d.Id})");
     }
 }
 

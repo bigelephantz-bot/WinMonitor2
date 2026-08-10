@@ -1067,6 +1067,7 @@ public sealed class MainForm : Form
                 DisplayName = source.DisplayName,
                 Category = source.Category,
                 Quantity = source.Quantity,
+                AmbiguousName = source.AmbiguousName,
             };
         }
 

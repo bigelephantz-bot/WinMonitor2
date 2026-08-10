@@ -210,6 +210,19 @@ public static class Loc
         ["set.diag.never"] = "Never",
         ["set.diag.none"] = "None",
         ["set.diag.milliseconds"] = "ms",
+        // Quantity suffixes, appended only when one hardware reuses a sensor name across
+        // quantities (LHM names a core's temperature, clock and power all "P-Core #1").
+        ["quantity.temperature"] = "Temperature",
+        ["quantity.fan"] = "Fan",
+        ["quantity.control"] = "PWM",
+        ["quantity.level"] = "Level",
+        ["quantity.power"] = "Power",
+        ["quantity.data"] = "Data",
+        ["quantity.voltage"] = "Voltage",
+        ["quantity.load"] = "Load",
+        ["quantity.frequency"] = "Frequency",
+        ["quantity.other"] = "Value",
+
         ["set.diag.history_size"] = "Session history spool",
         ["set.diag.history_truncated"] = "(cap reached — newest samples are not exported)",
         ["set.diag.open_log"] = "Open diagnostic log",
@@ -597,6 +610,19 @@ public static class Loc
         ["set.diag.never"] = "尚未發生",
         ["set.diag.none"] = "無",
         ["set.diag.milliseconds"] = "毫秒",
+        // 數量後綴：僅在同一硬體以相同名稱提供不同數量時附加
+        // （LHM 會把核心的溫度、時脈、功耗都命名為「P-Core #1」）。
+        ["quantity.temperature"] = "溫度",
+        ["quantity.fan"] = "轉速",
+        ["quantity.control"] = "PWM",
+        ["quantity.level"] = "百分比",
+        ["quantity.power"] = "功耗",
+        ["quantity.data"] = "資料量",
+        ["quantity.voltage"] = "電壓",
+        ["quantity.load"] = "使用率",
+        ["quantity.frequency"] = "頻率",
+        ["quantity.other"] = "數值",
+
         ["set.diag.history_size"] = "工作階段歷史暫存",
         ["set.diag.history_truncated"] = "（已達上限——最新的取樣不會出現在匯出中）",
         ["set.diag.open_log"] = "開啟診斷記錄",
