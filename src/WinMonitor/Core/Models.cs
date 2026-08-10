@@ -41,6 +41,14 @@ public sealed class SensorDescriptor
     /// <summary>Display name honoring user rename override; set by consumers, not by SensorService.</summary>
     public string DisplayName { get; set; } = "";
 
+    /// <summary>
+    /// True when another sensor on the same hardware carries this exact <see cref="Name"/> with a
+    /// different <see cref="Quantity"/> — LibreHardwareMonitor names a core's temperature, clock
+    /// and power all "P-Core #1". Set by SensorService once the whole descriptor set is known;
+    /// <c>AppConfig.DisplayNameFor</c> then appends the quantity so the rows can be told apart.
+    /// </summary>
+    public bool AmbiguousName { get; set; }
+
     public override string ToString() => $"{HardwareName} / {Name} ({Quantity})";
 }
 

@@ -18,6 +18,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(TrayUnitFormattingTests), TrayUnitFormattingTests),
     (nameof(IntelThermalStatusDecodeTests), IntelThermalStatusDecodeTests),
     (nameof(TrayIconLayoutTests), TrayIconLayoutTests),
+    (nameof(AmbiguousSensorNameTests), AmbiguousSensorNameTests),
     (nameof(EcSensorComputeTests), EcSensorComputeTests),
     (nameof(ConfigMigrationTests), ConfigMigrationTests),
 };
@@ -385,6 +386,69 @@ static void TrayIconLayoutTests()
     Check.True(canvas is not null, "Canvas size should be derived from the shell metric.");
     int size = (int)canvas!.GetValue(null)!;
     Check.True(size >= 16 && size <= 64, $"Canvas size {size} is outside the plausible range.");
+}
+
+static void AmbiguousSensorNameTests()
+{
+    // LibreHardwareMonitor gives a core's temperature, clock and power sensors the same Name, so
+    // "P-Core #1" shows up several times. SensorService flags those collisions and the display
+    // name gains a quantity suffix; names that are already unique must stay untouched.
+    MethodInfo? mark = typeof(SensorService).GetMethod(
+        "MarkAmbiguousNames", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(mark is not null, "Ambiguous-name detection should exist.");
+
+    const string cpu = "13th Gen Intel Core i7-1360P";
+    SensorDescriptor Cpu(string id, string name, SensorQuantity quantity) => new()
+    {
+        Id = id,
+        HardwareName = cpu,
+        Name = name,
+        Category = SensorCategory.Cpu,
+        Quantity = quantity,
+    };
+
+    var descriptors = new List<SensorDescriptor>
+    {
+        Cpu("/intelcpu/0/temperature/2", "P-Core #1", SensorQuantity.Temperature),
+        Cpu("/intelcpu/0/clock/1", "P-Core #1", SensorQuantity.Frequency),
+        Cpu("/intelcpu/0/temperature/14", "CPU Package", SensorQuantity.Temperature),
+        Cpu("/intelcpu/0/power/0", "CPU Package", SensorQuantity.Power),
+        Cpu("/intelcpu/0/temperature/0", "Core Max", SensorQuantity.Temperature),
+        Cpu("/intelcpu/0/load/0", "CPU Total", SensorQuantity.Load),
+        // Same name on DIFFERENT hardware is not a collision: each is unique in its own group.
+        new()
+        {
+            Id = "/battery/0/voltage/0", HardwareName = "Primary", Name = "Voltage",
+            Category = SensorCategory.Battery, Quantity = SensorQuantity.Voltage,
+        },
+    };
+
+    mark!.Invoke(null, new object[] { descriptors });
+
+    Check.True(descriptors[0].AmbiguousName, "A core temperature sharing its name must be flagged.");
+    Check.True(descriptors[1].AmbiguousName, "A core clock sharing its name must be flagged.");
+    Check.True(descriptors[2].AmbiguousName, "CPU Package temperature collides with its power sensor.");
+    Check.True(descriptors[3].AmbiguousName, "CPU Package power collides with its temperature sensor.");
+    Check.True(!descriptors[4].AmbiguousName, "A unique name must not be flagged.");
+    Check.True(!descriptors[5].AmbiguousName, "A unique name must not be flagged.");
+    Check.True(!descriptors[6].AmbiguousName, "Names only collide within one hardware.");
+
+    var config = new AppConfig();
+    Check.Equal("P-Core #1 (Temperature)", config.DisplayNameFor(descriptors[0]),
+        "A flagged sensor should carry its quantity.");
+    Check.Equal("P-Core #1 (Frequency)", config.DisplayNameFor(descriptors[1]),
+        "The colliding sensor should carry a different quantity.");
+    Check.Equal("CPU Package (Power)", config.DisplayNameFor(descriptors[3]),
+        "Power collisions should be separated too.");
+    Check.Equal("Core Max", config.DisplayNameFor(descriptors[4]),
+        "Unambiguous names must stay clean.");
+    Check.Equal("Voltage", config.DisplayNameFor(descriptors[6]),
+        "A name unique to its hardware must stay clean.");
+
+    // A user rename is their own disambiguation; appending to it would fight the user.
+    config.SensorOverrides[descriptors[0].Id] = new SensorOverride { Rename = "CPU 第一核心" };
+    Check.Equal("CPU 第一核心", config.DisplayNameFor(descriptors[0]),
+        "A rename must be used verbatim, with no quantity appended.");
 }
 
 static void EcSensorComputeTests()

@@ -857,6 +857,7 @@ public sealed class SensorService : IDisposable
             _throttleFallbackSensor = throttleFallback;
             // AddHardwareNode just Update()d every node (slow ones included) — counts as a slow update.
             _lastSlowUpdateMs = Environment.TickCount64;
+            MarkAmbiguousNames(descriptors);
             _descriptors = descriptors;
             _suppressedStorageTemperatureLimitSensorIds = suppressedStorageTemperatureLimitIds.ToArray();
             RecomputeActiveSetsLocked();
@@ -889,10 +890,48 @@ public sealed class SensorService : IDisposable
             Array.Copy(_allZones, merged, _allZones.Length);
             for (int i = 0; i < zones.Count; i++) merged[_allZones.Length + i] = zones[i];
             _allZones = merged;
+            MarkAmbiguousNames(descriptors);
             _descriptors = descriptors;
             RecomputeActiveSetsLocked();
         }
         DescriptorsChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Flags every descriptor whose <see cref="SensorDescriptor.Name"/> is shared, on the same
+    /// hardware, by a sensor of a different quantity. LibreHardwareMonitor names a core's
+    /// temperature, clock and power sensors all "P-Core #1", so the list would otherwise show
+    /// several identical rows; <c>AppConfig.DisplayNameFor</c> appends the quantity to those.
+    ///
+    /// Only real collisions are flagged, so unambiguous names ("Core Max", "Charge Level") stay
+    /// clean. Runs once per descriptor rebuild, never on the poll path.
+    /// </summary>
+    private static void MarkAmbiguousNames(List<SensorDescriptor> descriptors)
+    {
+        var firstQuantity = new Dictionary<string, SensorQuantity>(descriptors.Count, StringComparer.Ordinal);
+        var collided = new HashSet<string>(StringComparer.Ordinal);
+
+        for (int i = 0; i < descriptors.Count; i++)
+        {
+            SensorDescriptor d = descriptors[i];
+            string key = NameKey(d);
+            if (firstQuantity.TryGetValue(key, out SensorQuantity existing))
+            {
+                // Same name, same quantity is a different problem (a quantity suffix could not
+                // separate them either), so only a differing quantity counts as ambiguous.
+                if (existing != d.Quantity) collided.Add(key);
+            }
+            else
+            {
+                firstQuantity[key] = d.Quantity;
+            }
+        }
+
+        for (int i = 0; i < descriptors.Count; i++)
+            descriptors[i].AmbiguousName = collided.Contains(NameKey(descriptors[i]));
+
+        // '\n' cannot occur in a hardware or sensor name, so it is a safe key separator.
+        static string NameKey(SensorDescriptor d) => d.HardwareName + "\n" + d.Name;
     }
 
     /// <summary>Storage (SMART) and Battery nodes change slowly; polled at SlowUpdateMs cadence.</summary>

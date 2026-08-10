@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using WinMonitor.Core;
+using WinMonitor.Localization;
 
 namespace WinMonitor.Config;
 
@@ -99,17 +100,43 @@ public sealed class AppConfig
 
     public string DisplayNameFor(SensorDescriptor d)
     {
+        // A user rename is taken exactly as typed: they already disambiguated it themselves.
         if (SensorOverrides.TryGetValue(d.Id, out var o) && !string.IsNullOrWhiteSpace(o.Rename))
             return o.Rename!;
+
+        string name = d.Name;
+
         // Storage sensor names ("Temperature", "Used Space"...) are ambiguous when several
         // drives are present, so default to "<model> <sensor>" (HardwareName is the model
         // string from LHM, e.g. "Samsung SSD 990 PRO 2TB"). Flows to tooltips/alerts/logs.
         if (d.Category == SensorCategory.Storage
             && d.HardwareName.Length > 0
             && !d.Name.StartsWith(d.HardwareName, StringComparison.Ordinal))
-            return d.HardwareName + " " + d.Name;
-        return d.Name;
+            name = d.HardwareName + " " + d.Name;
+
+        // LibreHardwareMonitor gives a core's temperature, clock and power sensors the same name,
+        // so "P-Core #1" can appear three times. SensorService flags those collisions; appending
+        // the quantity is what separates them. Names with no collision are left untouched.
+        if (d.AmbiguousName)
+            name += " (" + Loc.T(QuantityKey(d.Quantity)) + ")";
+
+        return name;
     }
+
+    /// <summary>Localization key naming a quantity, used to disambiguate repeated sensor names.</summary>
+    private static string QuantityKey(SensorQuantity quantity) => quantity switch
+    {
+        SensorQuantity.Temperature => "quantity.temperature",
+        SensorQuantity.Fan => "quantity.fan",
+        SensorQuantity.Control => "quantity.control",
+        SensorQuantity.Level => "quantity.level",
+        SensorQuantity.Power => "quantity.power",
+        SensorQuantity.Data => "quantity.data",
+        SensorQuantity.Voltage => "quantity.voltage",
+        SensorQuantity.Load => "quantity.load",
+        SensorQuantity.Frequency => "quantity.frequency",
+        _ => "quantity.other",
+    };
 
     public bool IsHidden(string sensorId)
         => SensorOverrides.TryGetValue(sensorId, out var o) && o.Hidden;
