@@ -158,6 +158,39 @@ public sealed partial class SettingsForm
                 ? _ctx.Sensors.PawnIoVersion?.ToString() ?? Loc.T("set.diag.available")
                 : Loc.T("set.diag.unavailable")).AppendLine();
 
+        // Startup timings: the cold-start optimizations were reasoned about, never measured.
+        if (StartupTimeline.TotalMs > 0)
+        {
+            sb.AppendLine();
+            sb.Append(Loc.T("set.diag.startup")).Append(": ")
+              .Append(StartupTimeline.TotalMs.ToString("N0", CultureInfo.CurrentCulture)).Append(" ms");
+            if (StartupTimeline.ProcessStartOffsetMs > 0)
+                sb.Append(" (+").Append(StartupTimeline.ProcessStartOffsetMs.ToString("N0", CultureInfo.CurrentCulture))
+                  .Append(" ms ").Append(Loc.T("set.diag.before_main")).Append(')');
+            sb.AppendLine();
+            sb.Append("  ").Append(StartupTimeline.Describe()).AppendLine();
+        }
+
+        // Battery health, once the background powercfg report has landed.
+        if (BatteryReport.Current is { HealthFraction: { } fraction } battery)
+        {
+            sb.AppendLine();
+            sb.Append(Loc.T("set.diag.battery_health")).Append(": ")
+              .Append(fraction.ToString("P1", CultureInfo.CurrentCulture))
+              .Append("  (").Append(battery.DesignWh.ToString("0.0", CultureInfo.CurrentCulture))
+              .Append(" Wh -> ").Append(battery.FullChargeWh.ToString("0.0", CultureInfo.CurrentCulture)).Append(" Wh");
+            if (battery.HasCycleCount)
+                sb.Append(", ").Append(battery.CycleCount.ToString("N0", CultureInfo.CurrentCulture))
+                  .Append(' ').Append(Loc.T("set.diag.cycles"));
+            sb.Append(')').AppendLine();
+        }
+
+        // Thermal events: what was running when it got hot, which a toast cannot answer later.
+        string events = ThermalEventLog.Describe(12);
+        sb.AppendLine();
+        sb.Append(Loc.T("set.diag.events")).Append(':').AppendLine();
+        sb.Append(events.Length > 0 ? events : "  " + Loc.T("set.diag.no_events") + Environment.NewLine);
+
         // Session spool: an export silently missing its newest rows is otherwise invisible.
         long spoolBytes = _ctx.Stats.SessionHistoryBytes;
         sb.Append(Loc.T("set.diag.history_size")).Append(": ")

@@ -39,18 +39,30 @@ internal static class Program
         if (delaySeconds > 0)
             Thread.Sleep(TimeSpan.FromSeconds(delaySeconds));
 
-        AppConfig config = ConfigStore.Load();
+        // Before Load, not after: ConfigDirectory is a static property that needs no config, and
+        // loading is exactly when the events most worth recording happen (a corrupt file being
+        // backed up, a schema migration, a transient read failure). Initializing afterwards
+        // silently discarded all of them.
+        StartupTimeline.Begin();
         Diag.Initialize(ConfigStore.ConfigDirectory);
         Diag.Log("app", "Start (portable=" + ConfigStore.IsPortable
             + ", minimized=" + minimized + ", delay=" + delaySeconds + "s)");
+        StartupTimeline.Mark("diag");
+        AppConfig config = ConfigStore.Load();
+        StartupTimeline.Mark("config");
         Loc.Initialize(config.Language);
         Theme.Initialize(config.ThemeMode);
         Units.UseFahrenheit = config.UseFahrenheit;
         if (config.StartMinimized) minimized = true;
+        StartupTimeline.Mark("locale+theme");
 
         // Reclaim session spools abandoned by runs that did not exit cleanly (force-kill, crash,
         // power loss). Off the startup path: it only touches files older than several hours.
         ThreadPool.QueueUserWorkItem(_ => SessionHistoryStore.SweepOrphans());
+
+        // Battery capacities come from a powercfg report that takes a second or two to generate,
+        // so it must never sit on the startup path; the UI shows the values once they land.
+        BatteryReport.RefreshInBackground();
 
         Application.ThreadException += (_, e) => LogCrash(e.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, e) => LogCrash(e.ExceptionObject as Exception);
@@ -60,6 +72,10 @@ internal static class Program
         Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
 
         using var context = new WinMonitorContext(config, minimized);
+        // The context ctor opens the hardware backend, builds descriptors and performs the first
+        // synchronous poll, so it dominates cold start; emitting here captures that.
+        StartupTimeline.Mark("services+ui");
+        StartupTimeline.Emit();
         Application.Run(context);
     }
 
@@ -329,6 +345,8 @@ public sealed class WinMonitorContext : ApplicationContext
             var d = FindDescriptor(e.SensorId);
             string value = d is null ? e.Value.ToString("0.#") : Units.Format(d.Quantity, e.Value);
             string threshold = d is null ? e.Threshold.ToString("0.#") : Units.Format(d.Quantity, e.Threshold);
+            // Recorded on the UI thread so the foreground window it captures is the real one.
+            ThermalEventLog.Record(ThermalEventKind.Alert, e.DisplayName, e.Value);
             Tray.ShowToast(Loc.T("alert.title"), Loc.F("alert.body", e.DisplayName, value, threshold), ToolTipIcon.Warning);
             if (e.PlaySound) PlayAlertSound(e.SoundPath);
         });
@@ -336,9 +354,16 @@ public sealed class WinMonitorContext : ApplicationContext
 
     private void OnThrottleStateChanged(bool throttling)
     {
-        // Poll thread. Toast only on entry into the throttled state (debounce lives in SensorService).
-        if (!throttling || !Config.ThrottleToast) return;
-        InvokeOnUi(() => Tray.ShowToast(Loc.T("throttle.toast_title"), Loc.T("throttle.toast_body"), ToolTipIcon.Warning));
+        // Poll thread. Both transitions are recorded (the pair is what shows how long a throttle
+        // lasted), but only entry raises a toast; the debounce lives in SensorService.
+        InvokeOnUi(() =>
+        {
+            ThermalEventLog.Record(
+                throttling ? ThermalEventKind.ThrottleStarted : ThermalEventKind.ThrottleEnded,
+                Loc.T("throttle.sensor"), throttling ? 1f : 0f);
+            if (throttling && Config.ThrottleToast)
+                Tray.ShowToast(Loc.T("throttle.toast_title"), Loc.T("throttle.toast_body"), ToolTipIcon.Warning);
+        });
     }
 
     private static void PlayAlertSound(string? soundPath)

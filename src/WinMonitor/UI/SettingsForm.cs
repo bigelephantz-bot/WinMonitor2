@@ -87,7 +87,7 @@ public sealed partial class SettingsForm : Form
         base.OnLoad(e);
         // After layout, before the first paint: the tab strip now reports a real height, and
         // resizing here is invisible to the user.
-        FitTabsToContent();
+        FitTabsToContent(recenter: true);
     }
 
     private void OnOk(object? sender, EventArgs e)
@@ -321,8 +321,9 @@ public sealed partial class SettingsForm : Form
             _lastLocalization = Loc.Current;
             _lastDarkTheme = Theme.IsDark;
             _tabs.SelectedIndex = Math.Min(selectedIndex, _tabs.TabCount - 1);
-            // Label widths change with the language, so the fit has to be recomputed.
-            FitTabsToContent();
+            // Label widths change with the language, so the fit has to be recomputed — but the
+            // window is already on screen here, so it grows in place instead of jumping.
+            FitTabsToContent(recenter: false);
         }
         finally { _loading = previousLoading; }
         LoadAllTabs();
@@ -416,7 +417,7 @@ public sealed partial class SettingsForm : Form
 
     private void PruneOverride(string id)
     {
-        // Pinned must keep the override alive — MainForm's favorites live on this flag.
+        // Pinned must keep the override alive ??MainForm's favorites live on this flag.
         if (Config.SensorOverrides.TryGetValue(id, out var o)
             && string.IsNullOrEmpty(o.Rename) && !o.Hidden && !o.Pinned && o.Thresholds is null)
         {
@@ -504,7 +505,7 @@ public sealed partial class SettingsForm : Form
     /// Runs from OnLoad: before that the tab strip has not been laid out, so its height (and the
     /// chrome derived from it) would be wrong.
     /// </summary>
-    private void FitTabsToContent()
+    private void FitTabsToContent(bool recenter)
     {
         int contentW = 0, contentH = 0;
         foreach (TabPage page in _tabs.TabPages)
@@ -533,9 +534,16 @@ public sealed partial class SettingsForm : Form
         if (width <= Width && height <= Height) return;   // already large enough
 
         Size = new Size(Math.Max(width, Width), Math.Max(height, Height));
-        Location = new Point(
-            workingArea.X + Math.Max(0, (workingArea.Width - Width) / 2),
-            workingArea.Y + Math.Max(0, (workingArea.Height - Height) / 2));
+
+        // Only while the window is still coming up. Re-centring a visible window (the language
+        // rebuild re-measures because translated labels change width) would yank it out from
+        // under the user mid-edit.
+        if (recenter)
+        {
+            Location = new Point(
+                workingArea.X + Math.Max(0, (workingArea.Width - Width) / 2),
+                workingArea.Y + Math.Max(0, (workingArea.Height - Height) / 2));
+        }
         Diag.Log("ui", $"Settings sized to {Width}x{Height} for {contentW}x{contentH} of content");
     }
 

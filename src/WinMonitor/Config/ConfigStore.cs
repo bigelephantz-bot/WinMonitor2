@@ -111,6 +111,13 @@ public static class ConfigStore
                     // redirected to a recovery sibling so future fields cannot be erased.
                     int version = ReadSchemaVersion(root);
                     _loadedNewerSchema = version > CurrentSchemaVersion;
+                    if (_loadedNewerSchema)
+                    {
+                        Diag.Log("config", "File was written by a newer schema (v" + version
+                            + " > v" + CurrentSchemaVersion + "); saves divert to a recovery sibling");
+                    }
+                    if (version < CurrentSchemaVersion)
+                        Diag.Log("config", "Migrating schema v" + version + " -> v" + CurrentSchemaVersion);
                     while (version < CurrentSchemaVersion)
                     {
                         Migrate(root, version);
@@ -131,24 +138,27 @@ public static class ConfigStore
                 config = new AppConfig();
             }
         }
-        catch (IOException)
+        catch (IOException ex)
         {
             // The file may be perfectly fine; do not back it up or overwrite it.
             _loadFailed = true;
             config = new AppConfig();
+            Diag.Log("config", "Config unreadable (transient); running on defaults and diverting saves", ex);
         }
-        catch (JsonException) when (_loadedNewerSchema)
+        catch (JsonException ex) when (_loadedNewerSchema)
         {
             // An older build cannot prove this is corrupt: a newer schema may have changed a
             // known property's shape. Preserve the source and divert any later save instead.
             _loadFailed = true;
             config = new AppConfig();
+            Diag.Log("config", "Newer-schema config could not be parsed; source left untouched", ex);
         }
-        catch
+        catch (Exception ex)
         {
             // Corrupt or unreadable: keep the evidence, start from defaults.
             TryBackupCorrupt(path);
             config = new AppConfig();
+            Diag.Log("config", "Config corrupt; backed up to config.json.bak and reset to defaults", ex);
         }
 
         // A recovery sibling always uses this build's schema; the newer source file remains

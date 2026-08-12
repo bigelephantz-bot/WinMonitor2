@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using WinMonitor.Config;
 using WinMonitor.Core;
+using WinMonitor.Localization;
 using WinMonitor.Tray;
 
 var tests = new (string Name, Action Run)[]
@@ -18,6 +19,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(TrayUnitFormattingTests), TrayUnitFormattingTests),
     (nameof(IntelThermalStatusDecodeTests), IntelThermalStatusDecodeTests),
     (nameof(TrayIconLayoutTests), TrayIconLayoutTests),
+    (nameof(LocalizationCoverageTests), LocalizationCoverageTests),
     (nameof(AmbiguousSensorNameTests), AmbiguousSensorNameTests),
     (nameof(EcSensorComputeTests), EcSensorComputeTests),
     (nameof(ConfigMigrationTests), ConfigMigrationTests),
@@ -74,14 +76,39 @@ static void StatsTrackerHistoryTests()
     Check.Equal(1, tracker.GetHistory(unchartedId).Count,
         "CSV history must record sensors even when no chart requested them first.");
 
+    // A chart opened mid-session is backfilled from the spool. The scan reads from disk and is
+    // O(session), so it runs on a worker rather than the caller's thread: doing it inline froze
+    // the UI, because the chart and tray both call in from the UI thread. The first read
+    // therefore arms an empty ring and the history lands shortly after, version-bumped so the
+    // chart picks it up on its next tick.
     const string lateChartId = "/cpu/package/frequency/0";
     for (int i = 0; i < 4; i++)
         tracker.Accept(new[] { Sample(lateChartId, 1000f + i, firstTime.AddSeconds(3 + i)) });
+
     HistoryReadResult late = tracker.GetHistoryIfChanged(lateChartId, -1);
+    Check.True(late.Values is not null, "Arming a late chart must return immediately, not block on the scan.");
+
+    for (int waited = 0; waited < 100 && late.Values!.Length == 0; waited++)
+    {
+        Thread.Sleep(50);
+        late = tracker.GetHistoryIfChanged(lateChartId, -1);
+    }
     Check.True(late.Values is { Length: 3 },
-        "A chart opened later should receive the existing bounded history immediately.");
+        "A chart opened later should be backfilled with the existing bounded history.");
     Check.Equal(1001f, late.Values![0].Value, "Late chart history should retain the oldest in-capacity sample.");
     Check.Equal(1003f, late.Values[2].Value, "Late chart history should include the newest sample.");
+
+    // A reset while a backfill is in flight must win: restoring pre-reset samples would
+    // contradict ResetPeaks having cleared the chart.
+    const string racedId = "/cpu/package/voltage/0";
+    for (int i = 0; i < 4; i++)
+        tracker.Accept(new[] { Sample(racedId, 1f + i, firstTime.AddSeconds(20 + i)) });
+    tracker.GetHistoryIfChanged(racedId, -1);   // arms the ring and schedules the backfill
+    tracker.ResetPeaks();                        // invalidates it
+    Thread.Sleep(300);
+    HistoryReadResult raced = tracker.GetHistoryIfChanged(racedId, -1);
+    Check.True(raced.Values is { Length: 0 },
+        "A backfill scheduled before a peak reset must not repopulate cleared chart history.");
 }
 
 static void ConfigSanitizationTests()
@@ -386,6 +413,69 @@ static void TrayIconLayoutTests()
     Check.True(canvas is not null, "Canvas size should be derived from the shell metric.");
     int size = (int)canvas!.GetValue(null)!;
     Check.True(size >= 16 && size <= 64, $"Canvas size {size} is outside the plausible range.");
+}
+
+static void LocalizationCoverageTests()
+{
+    // The primary user reads zh-TW, and Loc.T falls back to English (then to the raw key) rather
+    // than throwing — so a missing translation is invisible in code review and only shows up as
+    // stray English, or a literal "set.foo.bar", in the shipped UI. This check is what makes that
+    // impossible to merge; it used to be an ad-hoc script run by hand.
+    var locType = typeof(Loc);
+    Dictionary<string, string> Dict(string field)
+    {
+        FieldInfo? f = locType.GetField(field, BindingFlags.Static | BindingFlags.NonPublic);
+        Check.True(f is not null, $"Loc.{field} dictionary should exist.");
+        return (Dictionary<string, string>)f!.GetValue(null)!;
+    }
+
+    Dictionary<string, string> en = Dict("En");
+    Dictionary<string, string> zh = Dict("ZhTw");
+    Check.True(en.Count > 200, $"English table looks truncated ({en.Count} keys).");
+
+    // Every key must exist in BOTH tables, in both directions.
+    var missingZh = new List<string>();
+    foreach (string key in en.Keys)
+        if (!zh.ContainsKey(key)) missingZh.Add(key);
+    Check.Equal(0, missingZh.Count,
+        "Keys missing a zh-TW translation: " + string.Join(", ", missingZh.Take(10)) + ".");
+
+    var missingEn = new List<string>();
+    foreach (string key in zh.Keys)
+        if (!en.ContainsKey(key)) missingEn.Add(key);
+    Check.Equal(0, missingEn.Count,
+        "Keys present only in zh-TW: " + string.Join(", ", missingEn.Take(10)) + ".");
+
+    // An empty value renders as a blank label, which is worse than an untranslated one.
+    foreach ((string key, string value) in en)
+        Check.True(!string.IsNullOrWhiteSpace(value), $"English value for '{key}' is blank.");
+    foreach ((string key, string value) in zh)
+        Check.True(!string.IsNullOrWhiteSpace(value), $"zh-TW value for '{key}' is blank.");
+
+    // Format placeholders must agree, or Loc.F throws (or silently drops an argument) in one
+    // language only — a class of bug that surfaces exclusively for the translated user.
+    foreach ((string key, string value) in en)
+    {
+        int enSlots = CountFormatSlots(value);
+        int zhSlots = CountFormatSlots(zh[key]);
+        Check.Equal(enSlots, zhSlots,
+            $"Format placeholder count differs for '{key}' (en={enSlots}, zh={zhSlots}).");
+    }
+
+    static int CountFormatSlots(string text)
+    {
+        var seen = new HashSet<int>();
+        for (int i = 0; i + 1 < text.Length; i++)
+        {
+            if (text[i] != '{') continue;
+            if (text[i + 1] == '{') { i++; continue; }   // escaped brace
+            int end = text.IndexOf('}', i + 1);
+            if (end < 0) continue;
+            string body = text[(i + 1)..end].Split(':')[0];
+            if (int.TryParse(body, out int index)) seen.Add(index);
+        }
+        return seen.Count;
+    }
 }
 
 static void AmbiguousSensorNameTests()

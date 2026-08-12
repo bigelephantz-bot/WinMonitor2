@@ -1,0 +1,65 @@
+name: CI
+
+# The app is Windows-only (WinForms + LibreHardwareMonitor), so everything runs on a Windows
+# runner. Sensor access needs elevation and real hardware, which CI has neither of — the
+# regression harness is deliberately hardware-free so it still runs here.
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to the same branch makes an in-flight run redundant.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore src/WinMonitor/WinMonitor.csproj
+
+      - name: Build (Release, warnings as errors)
+        # The codebase builds clean; treating warnings as errors here keeps it that way without
+        # making local iteration noisy.
+        run: dotnet build src/WinMonitor/WinMonitor.csproj -c Release --no-restore -warnaserror
+
+      - name: Regression harness
+        # A package-free console Exe, not a `dotnet test` project: it prints PASS/FAIL per check
+        # and exits non-zero on the first failure, which is what fails this step.
+        run: dotnet run --project tests/WinMonitor.Tests/WinMonitor.Tests.csproj -c Release
+
+      - name: Publish (verifies the release path still works)
+        run: dotnet publish src/WinMonitor/WinMonitor.csproj -c Release -r win-x64 --self-contained false -o artifacts/WinMonitor
+
+      - name: Verify the EC module ships
+        # The signed PawnIO module is what makes LG fan reading work; losing it from the publish
+        # output would silently disable that feature in a release.
+        shell: pwsh
+        run: |
+          $module = "artifacts/WinMonitor/pawnio/LpcACPIEC.bin"
+          if (-not (Test-Path $module)) { throw "Signed EC module missing from publish output: $module" }
+          Write-Host "EC module present ($((Get-Item $module).Length) bytes)"
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinMonitor-win-x64
+          path: artifacts/WinMonitor
+          retention-days: 7

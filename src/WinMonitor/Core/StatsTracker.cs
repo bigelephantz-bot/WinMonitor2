@@ -39,6 +39,11 @@ public sealed class StatsTracker : IDisposable
     private readonly SessionHistoryStore _sessionHistory = new();
     private bool _disposed;
 
+    // Bumped by ResetPeaks. A backfill started before a reset carries the generation it was
+    // scheduled under and is dropped on completion if it no longer matches, so cleared chart
+    // history can never be repopulated with samples from before the reset.
+    private long _resetGeneration;
+
     public StatsTracker(int historyCapacity = 3600)
     {
         _historyCapacity = Math.Max(1, historyCapacity);
@@ -221,47 +226,59 @@ public sealed class StatsTracker : IDisposable
     }
 
     /// <summary>
-    /// Allocates this sensor's chart ring the first time a consumer asks for its history, and
-    /// backfills it from the disk spool so a chart opened mid-session still shows what already
-    /// happened instead of starting blank.
+    /// Allocates this sensor's chart ring the first time a consumer asks for its history, then
+    /// backfills it from the disk spool on a worker so a chart opened mid-session shows what
+    /// already happened instead of starting blank.
     ///
     /// Laziness is what keeps memory down: at the default capacity every armed ring costs ~57 KB,
-    /// so arming all ~90 discovered sensors would spend several MB on curves nobody plots. The
-    /// backfill scan is O(session) but runs at most once per sensor, triggered by a user action
-    /// (ticking a chart box), and deliberately happens OUTSIDE <see cref="_gate"/> so it can never
-    /// stall the polling thread. Samples that arrive during the scan are appended afterwards, so
-    /// the ring stays in chronological order.
+    /// so arming all ~90 discovered sensors would spend several MB on curves nobody plots.
+    ///
+    /// The ring is published (empty) before returning, so this method is cheap and safe to call
+    /// from the chart's UI tick. The spool scan is O(session) and reads from disk, so it must NOT
+    /// run on the caller's thread — the chart and the tray both call in from the UI thread, and a
+    /// long session would freeze the window. The scan lands via <see cref="ApplyBackfill"/>, which
+    /// bumps the version so the chart picks it up on its next tick.
     /// </summary>
     private void EnsureHistoryArmed(string sensorId)
     {
         SessionHistoryReadSnapshot snapshot;
+        long generation;
         lock (_gate)
         {
             if (_disposed) return;
             Entry? entry = GetOrCreateEntryLocked(sensorId);
             if (entry is null || entry.History is not null) return;
 
-            // Publish the ring before releasing the lock: Accept starts filling it immediately,
-            // and a concurrent EnsureHistoryArmed sees it as armed and skips a duplicate scan.
+            // Publishing the ring here both starts collecting live samples immediately and makes
+            // a concurrent call see the sensor as armed, so only one backfill is ever scheduled.
             entry.History = new RingBuffer<TimedValue>(_historyCapacity);
             snapshot = _sessionHistory.Capture();
+            generation = _resetGeneration;
         }
 
-        var backfill = new List<TimedValue>();
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            var (tracker, id, snap, gen) = ((StatsTracker, string, SessionHistoryReadSnapshot, long))state!;
+            tracker.RunBackfill(id, snap, gen);
+        }, (this, sensorId, snapshot, generation));
+    }
+
+    /// <summary>Scans the spool for one sensor and hands the result to <see cref="ApplyBackfill"/>.</summary>
+    private void RunBackfill(string sensorId, SessionHistoryReadSnapshot snapshot, long generation)
+    {
+        // Collect straight into a ring: it discards the oldest sample in O(1), where trimming a
+        // List from the front is O(n) per record and turns a long session into a quadratic scan.
+        var backfill = new RingBuffer<TimedValue>(_historyCapacity);
         try
         {
             using (snapshot)
             {
                 int sensorIndex = Array.IndexOf(snapshot.SensorIds, sensorId);
-                if (sensorIndex >= 0)
+                if (sensorIndex < 0) return;
+                foreach (SessionHistoryRecord record in snapshot.ReadRecords())
                 {
-                    foreach (SessionHistoryRecord record in snapshot.ReadRecords())
-                    {
-                        if (record.SensorIndex != sensorIndex) continue;
-                        // Keep only the newest capacity worth; the ring would discard the rest.
-                        if (backfill.Count == _historyCapacity) backfill.RemoveAt(0);
-                        backfill.Add(new TimedValue(new DateTime(record.UtcTicks, DateTimeKind.Utc), record.Value));
-                    }
+                    if (record.SensorIndex != sensorIndex) continue;
+                    backfill.Add(new TimedValue(new DateTime(record.UtcTicks, DateTimeKind.Utc), record.Value));
                 }
             }
         }
@@ -272,15 +289,23 @@ public sealed class StatsTracker : IDisposable
             return;
         }
 
-        if (backfill.Count == 0) return;
+        if (backfill.Count > 0) ApplyBackfill(sensorId, backfill, generation);
+    }
 
+    /// <summary>
+    /// Splices scanned history in front of whatever arrived while the scan ran. Discards the
+    /// result when peaks were reset meanwhile: those samples predate the reset, and restoring
+    /// them would contradict ResetPeaks having cleared the chart.
+    /// </summary>
+    private void ApplyBackfill(string sensorId, RingBuffer<TimedValue> backfill, long generation)
+    {
         lock (_gate)
         {
-            if (_disposed) return;
+            if (_disposed || generation != _resetGeneration) return;
             if (!_entries.TryGetValue(sensorId, out Entry? entry) || entry.History is not { } live) return;
 
-            // Rebuild as backfill (older) followed by whatever arrived during the scan, so the
-            // ring's ordering contract holds and overflow still drops the oldest samples.
+            // Rebuild as backfill (older) followed by samples collected during the scan, so the
+            // ring stays in chronological order and overflow still drops the oldest.
             TimedValue[] arrivedDuringScan = live.ToArray();
             var rebuilt = new RingBuffer<TimedValue>(_historyCapacity);
             for (int i = 0; i < backfill.Count; i++) rebuilt.Add(backfill[i]);
@@ -298,6 +323,8 @@ public sealed class StatsTracker : IDisposable
     {
         lock (_gate)
         {
+            // Invalidates any backfill already in flight; see _resetGeneration.
+            _resetGeneration++;
             foreach (var entry in _entries.Values)
             {
                 entry.Stats.Reset();
