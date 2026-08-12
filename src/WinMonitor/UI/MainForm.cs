@@ -474,6 +474,7 @@ public sealed class MainForm : Form
                 }
 
                 if (!anyFanRows) AddInfoRow(groups[4], Loc.T("main.no_fans"));
+                AddBatteryHealthRow(groups);
 
                 MakeGroupsCollapsible();
             }
@@ -1390,6 +1391,27 @@ public sealed class MainForm : Form
             if (diff < bestDiff) { bestDiff = diff; selected = i; }
         }
         _chartMinutesCombo.SelectedIndex = selected;
+    }
+
+    /// <summary>
+    /// Adds the battery health summary to the Battery group. The live sensors give charge and a
+    /// degradation percentage but not the absolute capacities behind it, which is what makes
+    /// "how much battery have I actually lost" answerable — those come from BatteryReport.
+    /// Nothing is added on a desktop, or before the background report has landed.
+    /// </summary>
+    private void AddBatteryHealthRow(ListViewGroup[] groups)
+    {
+        BatteryHealth? health = BatteryReport.Current;
+        if (health?.HealthFraction is not { } fraction) return;
+
+        string cycles = health.HasCycleCount
+            ? health.CycleCount.ToString("N0", CultureInfo.CurrentCulture)
+            : Loc.T("bat.cycles_unavailable");
+        AddInfoRow(groups[3], Loc.F("bat.health_summary",
+            fraction.ToString("P1", CultureInfo.CurrentCulture),
+            health.DesignWh.ToString("0.0", CultureInfo.CurrentCulture),
+            health.FullChargeWh.ToString("0.0", CultureInfo.CurrentCulture),
+            cycles));
     }
 
     private void AddInfoRow(ListViewGroup group, string text)
