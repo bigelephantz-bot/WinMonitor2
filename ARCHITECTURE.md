@@ -42,9 +42,9 @@ public sealed class SensorService : IDisposable
 {
     public SensorService(AppConfig config);
     public void Start();                       // opens LHM Computer, starts polling timer (background, BelowNormal)
-    public void Stop();
+    public void Stop();                        // signals and joins, bounded; refuses to forget a thread it did not see exit
     public IReadOnlyList<SensorDescriptor> Descriptors { get; }   // stable after Start(); refreshed on RescanHardware()
-    public event Action<SensorSnapshot[]>? SnapshotUpdated;       // fired each poll tick, bg thread
+    public event Action<SensorSnapshot[], bool>? SnapshotUpdated; // fired each poll tick, bg thread; bool = every descriptor sampled
     public event Action? DescriptorsChanged;
     public void SetPollInterval(int ms);
     public void SetActiveSensorIds(IReadOnlyCollection<string>? ids); // smart polling: null = update all hardware; otherwise only hardware nodes containing these ids + a full refresh every 30s
@@ -59,6 +59,8 @@ public sealed class SensorService : IDisposable
 - Map LHM `SensorType` → `SensorQuantity`; classify `SensorCategory` from `HardwareType` (Fan sensors get category Fan regardless of parent hardware). Only surface quantities we display: Temperature, Fan, Control, Level, Power, Data, Voltage(battery only), Load(CPU total only), and Frequency(CPU clocks in MHz).
 - Include WMI fallback `MSAcpi_ThermalZoneTemperature` (root\WMI) as extra "ACPI Thermal Zone" temperature descriptors when elevated; ignore failures silently.
 - Poll loop: `System.Threading.Timer`; guard reentrancy; snapshot array reused only if safe — otherwise allocate one array per tick (acceptable) but no LINQ in the tick path.
+- **A snapshot is "complete" only when the full node sweep ran *and*, where EC sensors exist, this was one of their throttled read ticks.** Ids missing from a partial snapshot mean "not sampled this tick", never "no reading" — any consumer that records absence as data must wait for a complete snapshot (see `HistoryLogger`). Configured-but-unavailable EC sensors are excluded from the condition; nothing will ever fill them.
+- **Shutdown may not outrun the poll thread.** A tick wedged in a native `Update()`, an EC read or a rescan still owns the `Computer`, the EC and the wait handles, so `PollThreadHandle` keeps the thread reference until an exit is *observed*: a timed-out `Join` is not an exit. `Dispose` releases natives only on a confirmed exit, otherwise hands them to a background watchdog and, failing that, deliberately leaks them to process exit — an undisposed LHM driver handle is recoverable (`sc.exe delete R0WinMonitor`), a teardown under a live native call is not. `Start` refuses to run a second poll thread while a previous one lives.
 
 ### Core/StatsTracker.cs
 ```csharp
@@ -98,14 +100,15 @@ public sealed record AlertEvent(string SensorId, string DisplayName, float Value
 ```csharp
 public sealed class HistoryLogger : IDisposable
 {
-    public HistoryLogger(AppConfig config, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider);
-    public void Accept(SensorSnapshot[] snapshots);  // bg thread; no-op unless config.Logging.Enabled
+    public HistoryLogger(AppConfig config, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider, string? logDirectory = null);
+    public void Accept(SensorSnapshot[] snapshots, bool complete, Action? requestCompleteSnapshot = null); // bg thread; no-op unless config.Logging.Enabled
     public static string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors, Func<string, IReadOnlyList<TimedValue>> historyProvider);
     public string LogDirectory { get; }
     public void CleanupRetention();  // delete logs older than RetentionDays
 }
 ```
 - Background log: one CSV per day `winmonitor-YYYYMMDD.csv`, header = sensor display names, row per logging tick (config.Logging.IntervalSeconds, independent of poll), buffered StreamWriter, flush every 30s.
+- **Row completeness is the logger's own responsibility, not a timer's.** When a row falls due on a partial snapshot the logger calls `requestCompleteSnapshot` (wired to `SensorService.RequestFullSweep`) and writes from the complete snapshot that follows — one full sweep per logging interval, no SMART sensor kept active per poll. The request repeats on every due tick, so a lost or mistimed sweep self-corrects. Do not reintroduce a UI timer that requests sweeps on a period *shorter* than the logging interval: it drifts earlier every cycle until the sweep is consumed before the writer is due, and the resulting rows are silently sparse.
 
 ### Tray/IconRenderer.cs + Tray/TrayIconManager.cs
 ```csharp

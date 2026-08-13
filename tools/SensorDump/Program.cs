@@ -32,7 +32,7 @@ Console.WriteLine();
 var latest = new Dictionary<string, float?>();
 var gate = new ManualResetEventSlim(false);
 int ticks = 0;
-svc.SnapshotUpdated += snaps =>
+svc.SnapshotUpdated += (snaps, _) =>
 {
     foreach (var s in snaps) latest[s.Id] = s.Value;
     if (Interlocked.Increment(ref ticks) >= 3) gate.Set();
@@ -88,7 +88,7 @@ static int RunEcProbe(string[] args)
     var latestLock = new object();
 
     using var service = new SensorService(config);
-    service.SnapshotUpdated += snapshots =>
+    service.SnapshotUpdated += (snapshots, _) =>
     {
         lock (latestLock)
         {
