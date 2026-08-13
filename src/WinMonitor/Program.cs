@@ -141,9 +141,9 @@ public sealed class WinMonitorContext : ApplicationContext
     // never triggers twice. -1 = never auto-reset this session.
     private readonly System.Windows.Forms.Timer _peakResetTimer;
 
-    // Drives one full hardware sweep per background-logging interval so smart polling can stay
-    // on while logging (see SyncLoggingSweepTimer). Null whenever logging is disabled.
-    private System.Windows.Forms.Timer? _loggingSweepTimer;
+    // Handed to HistoryLogger so a due CSV row can pull one full hardware sweep instead of
+    // recording whatever smart polling happened to sample. Cached: OnSnapshot runs per tick.
+    private readonly Action _requestLoggingSweep;
     private long _lastAutoPeakResetTick = -1;
 
     // Throttle-indicator enabled state at the last ApplySettings. When it flips, the descriptor
@@ -175,6 +175,7 @@ public sealed class WinMonitorContext : ApplicationContext
         _sync.HotkeyPressed += OnHotkeyPressed;
 
         Sensors = new SensorService(() => Config);
+        _requestLoggingSweep = () => Sensors.RequestFullSweep();
         Stats = new StatsTracker();
         Alerts = new AlertEngine(() => Config);
         Logger = new HistoryLogger(() => Config, () => Sensors.Descriptors);
@@ -239,13 +240,15 @@ public sealed class WinMonitorContext : ApplicationContext
 
     // ---------- data fan-out ----------
 
-    private void OnSnapshot(SensorSnapshot[] snapshots)
+    private void OnSnapshot(SensorSnapshot[] snapshots, bool complete)
     {
         // Background thread. Order matters: stats first so consumers see fresh min/max.
         Stats.Accept(snapshots);
         Alerts.Accept(snapshots, Sensors.Descriptors);
         Tray.Accept(snapshots);
-        Logger.Accept(snapshots);
+        // Only background CSV needs a complete picture; everything above is happy with whatever
+        // smart polling sampled this tick. The cached delegate keeps the per-tick path allocation-free.
+        Logger.Accept(snapshots, complete, _requestLoggingSweep);
         UpdateCpuThermal(snapshots);
 
         var main = _mainForm;
@@ -398,7 +401,6 @@ public sealed class WinMonitorContext : ApplicationContext
         if (windowVisible)
         {
             Sensors.SetActiveSensorIds(null);
-            SyncLoggingSweepTimer();
             return;
         }
 
@@ -418,48 +420,14 @@ public sealed class WinMonitorContext : ApplicationContext
         foreach (var d in Sensors.Descriptors)
             if (Config.ResolveThresholds(d).AlertEnabled) ids.Add(d.Id);
         Sensors.SetActiveSensorIds(ids);
-        SyncLoggingSweepTimer();
     }
 
-    /// <summary>
-    /// Keeps the logging sweep timer in step with the current configuration.
-    ///
-    /// Background CSV promises a complete row at its configured interval, but that interval
-    /// (30 s by default) is much longer than the poll interval. Forcing every descriptor to stay
-    /// active would sweep all hardware — including SSD SMART, which wakes the drive — on every
-    /// tick for the whole session, which is exactly the battery cost smart polling exists to
-    /// avoid. Requesting one full sweep per logging interval keeps rows complete while leaving
-    /// the intervening ticks on the smart-polled set.
-    /// </summary>
-    private void SyncLoggingSweepTimer()
-    {
-        bool wanted = Config.Logging.Enabled;
-        if (!wanted)
-        {
-            if (_loggingSweepTimer is { } stop)
-            {
-                stop.Stop();
-                stop.Dispose();
-                _loggingSweepTimer = null;
-            }
-            return;
-        }
-
-        // Sweep slightly ahead of the writer so the values it records are freshly swept.
-        int intervalMs = Math.Max(1, Config.Logging.IntervalSeconds) * 1000;
-        intervalMs = Math.Max(1000, intervalMs - 500);
-
-        if (_loggingSweepTimer is { } timer)
-        {
-            if (timer.Interval != intervalMs) timer.Interval = intervalMs;
-            timer.Start();
-            return;
-        }
-
-        _loggingSweepTimer = new System.Windows.Forms.Timer { Interval = intervalMs };
-        _loggingSweepTimer.Tick += (_, _) => Sensors.RequestFullSweep();
-        _loggingSweepTimer.Start();
-    }
+    // Background CSV used to be kept complete by a UI timer that requested a full sweep every
+    // (logging interval - 500 ms). That period is shorter than the interval it serves, so the
+    // sweep drifted half a second earlier on every cycle until it landed on a tick before the
+    // writer was due: the sweep was consumed, and the row that followed came from an
+    // active-only snapshot with blank columns. The logger now pulls a sweep when it is actually
+    // due (see HistoryLogger.Accept), which cannot drift and does not involve the UI thread.
 
     // ---------- windows ----------
 
@@ -909,7 +877,6 @@ public sealed class WinMonitorContext : ApplicationContext
         TryCleanup(Sensors.Stop);
         TryCleanup(_peakResetTimer.Stop);
         TryCleanup(_peakResetTimer.Dispose);
-        TryCleanup(() => { _loggingSweepTimer?.Stop(); _loggingSweepTimer?.Dispose(); _loggingSweepTimer = null; });
         TryCleanup(_sync.UnregisterCompactHotkey);
         TryCleanup(() => _flyout?.Dispose());
         TryCleanup(Tray.Dispose);

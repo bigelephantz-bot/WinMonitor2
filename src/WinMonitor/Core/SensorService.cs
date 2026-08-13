@@ -38,6 +38,9 @@ public sealed class SensorService : IDisposable
     private const int FullRefreshMs = 30000; // smart polling: full hardware sweep at least this often
     private const int SlowUpdateMs = 15000;  // Storage/Battery nodes update at most this often
     private const int NodeFailureLimit = 3;  // consecutive Update() failures before a node's sensors read as null
+    private const int StopJoinMs = 2000;     // interactive stop: bounded so no caller hangs on a wedged read
+    private const int ShutdownJoinMs = 4000; // exit: waited before cleanup is handed to the watchdog
+    private const int DeferredJoinMs = 15000;// watchdog: how long deferred cleanup waits for a wedged tick
 
     private readonly Func<AppConfig> _configProvider;
     private readonly object _sync = new();
@@ -46,7 +49,10 @@ public sealed class SensorService : IDisposable
 
     private Computer? _computer;
     private ManagementObjectSearcher? _wmiSearcher;
-    private Thread? _thread;
+    // Tracks the poll thread's *observed* liveness, not merely whether a stop was requested:
+    // nothing the thread touches may be released until it is known to have left.
+    private readonly PollThreadHandle _worker = new();
+    private int _resourcesReleased;          // Interlocked: native/OS cleanup runs exactly once
     private int _intervalMs;
     private int _polling;                    // Interlocked reentrancy guard
     private volatile bool _rescanRequested;  // consumed on the polling thread
@@ -141,8 +147,14 @@ public sealed class SensorService : IDisposable
     /// <summary>Shared read-only Embedded Controller accessor (used by the EC Explorer UI too).</summary>
     public EmbeddedController Ec => _ec;
 
-    /// <summary>Fired each poll tick on the polling (background) thread.</summary>
-    public event Action<SensorSnapshot[]>? SnapshotUpdated;
+    /// <summary>
+    /// Fired each poll tick on the polling (background) thread. The flag is true only when the
+    /// tick sampled every descriptor: smart polling narrows most ticks to the active set, and the
+    /// EC is read on its own throttled cadence, so a partial snapshot's absent ids mean "not
+    /// sampled", not "no reading". A consumer that promises a complete picture — background CSV —
+    /// must wait for a complete snapshot rather than record the gaps. See <see cref="RequestFullSweep"/>.
+    /// </summary>
+    public event Action<SensorSnapshot[], bool>? SnapshotUpdated;
 
     /// <summary>Fired after a hardware rescan rebuilt the descriptor list (background thread).</summary>
     public event Action? DescriptorsChanged;
@@ -170,7 +182,7 @@ public sealed class SensorService : IDisposable
     public SensorHealthSnapshot GetHealthSnapshot()
     {
         return new SensorHealthSnapshot(
-            IsRunning: _thread is { IsAlive: true } && !_stopEvent.IsSet,
+            IsRunning: _worker.IsRunning && !_stopEvent.IsSet,
             SuccessfulPollCount: Interlocked.Read(ref _successfulPollCount),
             FailedPollCount: Interlocked.Read(ref _failedPollCount),
             NodeUpdateFailureCount: Interlocked.Read(ref _nodeUpdateFailureCount),
@@ -195,7 +207,9 @@ public sealed class SensorService : IDisposable
     /// </summary>
     public void Start()
     {
-        if (_disposed || _thread is not null) return;
+        // PollThreadHandle.Start refuses to run a second worker while a previous one is alive, so
+        // a stop that timed out cannot end with two threads polling the same hardware.
+        if (_disposed || _worker.IsRunning) return;
 
         AppConfig config = CurrentConfig;
         _intervalMs = Math.Clamp(config.PollIntervalMs, MinIntervalMs, MaxIntervalMs);
@@ -210,25 +224,22 @@ public sealed class SensorService : IDisposable
         _stopEvent.Reset();
         Poll(); // synchronous first tick: consumers get data immediately
 
-        _thread = new Thread(PollLoop)
-        {
-            IsBackground = true,
-            Name = "WinMonitor.SensorPoll",
-            Priority = ThreadPriority.BelowNormal,
-        };
-        _thread.Start();
+        _worker.Start(PollLoop, "WinMonitor.SensorPoll", ThreadPriority.BelowNormal);
     }
 
-    public void Stop()
+    /// <summary>
+    /// Signals the polling thread and waits, briefly, for it to leave. Bounded so an interactive
+    /// caller never hangs on a wedged native read; callers that go on to release resources must
+    /// use <see cref="TryStop"/> and honour its result.
+    /// </summary>
+    public void Stop() => TryStop(StopJoinMs);
+
+    /// <summary>Requests a stop and reports whether the polling thread was observed to exit.</summary>
+    private bool TryStop(int joinMs)
     {
-        Thread? t = _thread;
-        if (t is null) return;
-        _thread = null;
-        _stopEvent.Set();
-        if (!ReferenceEquals(t, Thread.CurrentThread))
-        {
-            try { t.Join(2000); } catch { /* thread state races are non-fatal on shutdown */ }
-        }
+        if (_worker.Pending is null) return true;
+        try { _stopEvent.Set(); } catch (ObjectDisposedException) { return true; }
+        return _worker.Join(joinMs);
     }
 
     public void SetPollInterval(int ms)
@@ -321,7 +332,59 @@ public sealed class SensorService : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        try { Stop(); } catch { }
+
+        bool exited;
+        try { exited = TryStop(ShutdownJoinMs); }
+        catch { exited = false; }
+        if (exited)
+        {
+            ReleaseResources();
+            return;
+        }
+
+        // The poll thread is still inside something native — an LHM Update(), an EC read, a
+        // rescan. Closing the Computer or disposing the wait handles under it corrupts that call
+        // rather than tidying up after it. Hand the release to a watchdog that waits for the
+        // thread to actually leave, and let shutdown continue meanwhile: a bounded exit matters
+        // more than a prompt driver unload.
+        Diag.Log("sensors", "Poll thread still running after " + ShutdownJoinMs
+            + " ms; deferring hardware cleanup");
+        Thread? worker = _worker.Pending;
+        var watchdog = new Thread(() => DeferredRelease(worker))
+        {
+            IsBackground = true,
+            Name = "WinMonitor.SensorCleanup",
+        };
+        watchdog.Start();
+    }
+
+    /// <summary>
+    /// Waits out a wedged poll tick and then releases. If the thread never leaves — or the process
+    /// exits first — the native objects are deliberately left alone: an undisposed LHM driver
+    /// handle is the documented, recoverable leftover (<c>sc.exe delete R0WinMonitor</c>), while
+    /// tearing down a Computer under a live native call is not recoverable.
+    /// </summary>
+    private void DeferredRelease(Thread? worker)
+    {
+        bool exited;
+        try { exited = worker is null || worker.Join(DeferredJoinMs); }
+        catch { exited = false; }
+        if (!exited)
+        {
+            Diag.Log("sensors", "Poll thread never exited; leaving hardware handles to process exit");
+            return;
+        }
+        ReleaseResources();
+        Diag.Log("sensors", "Deferred hardware cleanup completed");
+    }
+
+    /// <summary>
+    /// Releases every native and OS resource exactly once. Must only be called once the polling
+    /// thread has been observed to exit.
+    /// </summary>
+    private void ReleaseResources()
+    {
+        if (Interlocked.Exchange(ref _resourcesReleased, 1) != 0) return;
         try { _intelThermalStatus?.Dispose(); } catch { }
         _intelThermalStatus = null;
         try { _ec.Dispose(); } catch { }
@@ -558,7 +621,12 @@ public sealed class SensorService : IDisposable
             else if (throttleFinalClear)
                 snapshots[n++] = new SensorSnapshot { Id = WellKnown.ThrottleSensorId, Value = 0f, UtcTimestamp = utc };
 
-            SnapshotUpdated?.Invoke(snapshots);
+            // "Complete" means every descriptor was actually sampled this tick: the full node sweep
+            // ran, and — when EC sensors exist — this was one of their throttled read ticks. EC
+            // sensors that are configured but unavailable can never be sampled, so they must not
+            // hold completeness hostage; the descriptors are there but nothing will ever fill them.
+            bool complete = full && (!emitEc || ecReadTick);
+            SnapshotUpdated?.Invoke(snapshots, complete);
             Volatile.Write(ref _lastSnapshotCount, n);
             Interlocked.Increment(ref _successfulPollCount);
             Interlocked.Exchange(ref _lastSuccessfulPollUtcTicks, utc.Ticks);
