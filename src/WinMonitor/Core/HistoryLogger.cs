@@ -7,8 +7,9 @@ namespace WinMonitor.Core;
 /// <summary>
 /// Optional background CSV logging plus one-shot CSV exports.
 /// Background log: one file per local day (winmonitor-yyyyMMdd.csv), one column per
-/// descriptor, one row per logging interval (independent of the poll interval), buffered
-/// writer flushed every 30 s. Every IO operation is wrapped — logging must never crash
+/// descriptor, one row per logging interval (independent of the poll interval, and deferred to
+/// the first complete snapshot at or after it so no column is blank for want of sampling),
+/// buffered writer flushed every 30 s. Every IO operation is wrapped — logging must never crash
 /// monitoring. Accept runs on the polling background thread; Dispose on the UI thread.
 /// </summary>
 public sealed class HistoryLogger : IDisposable
@@ -37,21 +38,43 @@ public sealed class HistoryLogger : IDisposable
 
     public string LogDirectory { get; }
 
-    public HistoryLogger(AppConfig config, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider)
-        : this(() => config, descriptorProvider)
+    public HistoryLogger(AppConfig config, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider,
+        string? logDirectory = null)
+        : this(() => config, descriptorProvider, logDirectory)
     {
     }
 
     /// <summary>Uses a fully replaced configuration snapshot for each non-hot logging decision.</summary>
-    public HistoryLogger(Func<AppConfig> configProvider, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider)
+    /// <param name="logDirectory">
+    /// Overrides the log location. The application always uses the default; the regression harness
+    /// passes a temporary directory so the writer path can be exercised without touching real logs.
+    /// </param>
+    public HistoryLogger(Func<AppConfig> configProvider, Func<IReadOnlyList<SensorDescriptor>> descriptorProvider,
+        string? logDirectory = null)
     {
         _configProvider = configProvider ?? throw new ArgumentNullException(nameof(configProvider));
         _descriptorProvider = descriptorProvider;
-        LogDirectory = Path.Combine(ConfigStore.ConfigDirectory, "logs");
+        LogDirectory = string.IsNullOrWhiteSpace(logDirectory)
+            ? Path.Combine(ConfigStore.ConfigDirectory, "logs")
+            : logDirectory;
     }
 
-    /// <summary>Background thread. No-op unless logging is enabled and the interval elapsed.</summary>
-    public void Accept(SensorSnapshot[] snapshots)
+    /// <summary>
+    /// Background thread. No-op unless logging is enabled and the interval elapsed.
+    ///
+    /// <paramref name="complete"/> reports whether the tick sampled every descriptor. Smart polling
+    /// narrows most ticks to the active set, so a row written from a partial snapshot would leave
+    /// unrelated columns blank — indistinguishable, in the CSV, from a sensor that failed. When a
+    /// row is due on a partial tick the logger asks for one full sweep instead and writes from the
+    /// snapshot that produces, which costs one complete sweep per logging interval rather than
+    /// keeping every SMART sensor active on every poll.
+    /// </summary>
+    /// <param name="requestCompleteSnapshot">
+    /// Invoked when a due row cannot be written yet. Must be idempotent: it is called on every due
+    /// tick until a complete snapshot arrives, which is what makes a lost or mistimed request
+    /// self-correcting rather than a stalled log.
+    /// </param>
+    public void Accept(SensorSnapshot[] snapshots, bool complete, Action? requestCompleteSnapshot = null)
     {
         AppConfig config = _configProvider();
         if (_disposed) return;
@@ -67,6 +90,12 @@ public sealed class HistoryLogger : IDisposable
         var nowUtc = DateTime.UtcNow;
         int interval = Math.Max(1, config.Logging.IntervalSeconds);
         if ((nowUtc - _lastWriteUtc).TotalSeconds < interval) return;
+
+        if (!complete)
+        {
+            requestCompleteSnapshot?.Invoke();
+            return;
+        }
 
         lock (_gate)
         {

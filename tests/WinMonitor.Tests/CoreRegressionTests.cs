@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -23,6 +24,9 @@ var tests = new (string Name, Action Run)[]
     (nameof(AmbiguousSensorNameTests), AmbiguousSensorNameTests),
     (nameof(EcSensorComputeTests), EcSensorComputeTests),
     (nameof(ConfigMigrationTests), ConfigMigrationTests),
+    (nameof(LoggingCompletenessTests), LoggingCompletenessTests),
+    (nameof(PollThreadLifetimeTests), PollThreadLifetimeTests),
+    (nameof(TrayLatestValuePruneTests), TrayLatestValuePruneTests),
 };
 
 int failures = 0;
@@ -305,11 +309,160 @@ static void HistoryLoggerDisableTests()
     var stream = new MemoryStream();
     var writer = new StreamWriter(stream);
     writerField!.SetValue(logger, writer);
-    logger.Accept(Array.Empty<SensorSnapshot>());
+    logger.Accept(Array.Empty<SensorSnapshot>(), complete: true);
 
     Check.True(writerField.GetValue(logger) is null,
         "Disabling logging should immediately release the open writer.");
     Check.True(!stream.CanWrite, "Disabling logging should close the underlying file stream.");
+}
+
+/// <summary>
+/// A due CSV row must never be written from a snapshot that smart polling narrowed: the columns it
+/// skipped would read as missing data. Regression for the sweep timer that drifted ahead of the
+/// writer until the full sweep was consumed by an earlier tick.
+/// </summary>
+static void LoggingCompletenessTests()
+{
+    string directory = Path.Combine(Path.GetTempPath(), "WinMonitor-logtest-" + Guid.NewGuid().ToString("N"));
+    var config = new AppConfig
+    {
+        Logging = new LoggingConfig { Enabled = true, IntervalSeconds = 1, RetentionDays = 0 },
+    };
+    var active = Descriptor("/test/active", "Active");
+    var idle = Descriptor("/test/idle", "Idle");
+    var descriptors = new[] { active, idle };
+
+    try
+    {
+        DateTime now = DateTime.UtcNow;
+        int sweepRequests = 0;
+        void RequestSweep() => sweepRequests++;
+
+        // Disposing closes and flushes the buffered writer, so the file is only read afterwards.
+        using (var logger = new HistoryLogger(config, () => descriptors, directory))
+        {
+            // A partial tick: only the active sensor was sampled. A row is due (none written yet),
+            // so the logger must pull a sweep instead of recording a blank column for the other.
+            logger.Accept(new[] { Sample(active.Id, 40f, now) }, complete: false, RequestSweep);
+            Check.Equal(1, sweepRequests, "A due row on a partial snapshot should request a full sweep.");
+            Check.True(!Directory.Exists(directory) || Directory.GetFiles(directory, "*.csv").Length == 0,
+                "A partial snapshot must not produce a CSV row.");
+
+            // Still partial: the request must repeat, so a lost or mistimed sweep cannot stall the log.
+            logger.Accept(new[] { Sample(active.Id, 41f, now.AddMilliseconds(200)) }, complete: false, RequestSweep);
+            Check.Equal(2, sweepRequests, "Each due tick without a complete snapshot should re-request.");
+
+            // The complete snapshot arrives: the row is written now, with both columns populated.
+            logger.Accept(new[]
+            {
+                Sample(active.Id, 42f, now.AddMilliseconds(400)),
+                Sample(idle.Id, 55f, now.AddMilliseconds(400)),
+            }, complete: true, RequestSweep);
+
+            // Inside the interval: a further complete snapshot must not add a second row.
+            logger.Accept(new[]
+            {
+                Sample(active.Id, 43f, now.AddMilliseconds(600)),
+                Sample(idle.Id, 56f, now.AddMilliseconds(600)),
+            }, complete: true, RequestSweep);
+            Check.Equal(2, sweepRequests, "A snapshot inside the logging interval should not re-request.");
+        }
+
+        string[] files = Directory.GetFiles(directory, "winmonitor-*.csv");
+        Check.Equal(1, files.Length, "A complete snapshot should open exactly one CSV.");
+        string[] lines = File.ReadAllLines(files[0]);
+        Check.Equal(2, lines.Length, "The CSV should hold a header plus exactly one data row.");
+        string[] fields = lines[1].Split(',');
+        Check.Equal(3, fields.Length, "The row should carry a timestamp plus both sensor columns.");
+        Check.True(fields[1].Length > 0 && fields[2].Length > 0,
+            "Neither column may be blank in a row written from a complete snapshot.");
+    }
+    finally
+    {
+        try { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); } catch { }
+    }
+}
+
+/// <summary>
+/// Shutdown must distinguish "asked the poll thread to stop" from "the poll thread has left".
+/// A tick wedged in a native LHM/EC call still owns the Computer and the wait handles, so a
+/// timed-out join may not be treated as an exit.
+/// </summary>
+static void PollThreadLifetimeTests()
+{
+    using var release = new ManualResetEventSlim(false);
+    using var entered = new ManualResetEventSlim(false);
+    var handle = new PollThreadHandle();
+
+    Check.True(handle.Join(0), "An unused handle has nothing to wait for.");
+
+    Check.True(handle.Start(() => { entered.Set(); release.Wait(); }, "test-worker", ThreadPriority.Normal),
+        "Starting the first worker should succeed.");
+    Check.True(entered.Wait(TimeSpan.FromSeconds(10)), "The worker should reach its body.");
+    Check.True(handle.IsRunning, "A worker inside its body should report as running.");
+
+    // The worker is deliberately stuck: the join must fail and the handle must keep the reference.
+    Check.True(!handle.Join(50), "A join that times out must not report an exit.");
+    Check.True(handle.Pending is not null, "A worker that was never seen leaving must stay pending.");
+
+    bool secondStarted = handle.Start(() => { }, "second-worker", ThreadPriority.Normal);
+    Check.True(!secondStarted, "A second worker must not start on top of a live one.");
+
+    release.Set();
+    Check.True(handle.Join(10000), "A worker that exits should be observed.");
+    Check.True(handle.Pending is null, "An observed exit should release the worker reference.");
+
+    using var restarted = new ManualResetEventSlim(false);
+    Check.True(handle.Start(() => restarted.Set(), "third-worker", ThreadPriority.Normal),
+        "A new worker should start once the previous exit was observed.");
+    Check.True(restarted.Wait(TimeSpan.FromSeconds(10)), "The replacement worker should run.");
+    Check.True(handle.Join(10000), "The replacement worker should be joinable.");
+}
+
+/// <summary>
+/// The tray's latest-value cache is keyed by sensor id and fed by the poll thread; a descriptor
+/// rebuild must drop ids that no longer exist or the cache grows for the whole session.
+/// </summary>
+static void TrayLatestValuePruneTests()
+{
+    MethodInfo? prune = typeof(TrayIconManager).GetMethod(
+        "PruneStaleValues", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(prune is not null, "Tray value pruning should exist.");
+
+    var latest = new System.Collections.Concurrent.ConcurrentDictionary<string, float?>(StringComparer.Ordinal);
+    for (int i = 0; i < 500; i++) latest["/test/sensor/" + i] = i;
+    latest["/test/null"] = null;
+
+    var current = new[] { Descriptor("/test/sensor/7", "Kept"), Descriptor("/test/sensor/11", "Also kept") };
+    prune!.Invoke(null, new object[] { latest, current });
+
+    Check.Equal(2, latest.Count, "Pruning should keep only values for current descriptors.");
+    Check.True(latest.ContainsKey("/test/sensor/7") && latest.ContainsKey("/test/sensor/11"),
+        "Pruning must not drop values that are still described.");
+    Check.True(!latest.ContainsKey("/test/null"),
+        "A cached null for a removed descriptor should be pruned like any other entry.");
+
+    // An empty descriptor list is a real state (a rescan that found nothing) and must clear, not throw.
+    prune.Invoke(null, new object[] { latest, Array.Empty<SensorDescriptor>() });
+    Check.Equal(0, latest.Count, "A rebuild with no descriptors should empty the cache.");
+
+    // Correct pruning that nothing calls is still an unbounded cache: drive the real rebuild path.
+    var config = new AppConfig();
+    config.Active.TrayIcons.Clear();          // no NotifyIcon needed to exercise the cache
+    using var stats = new StatsTracker(historyCapacity: 1);
+    using var tray = new TrayIconManager(config, stats, new ImmediateSync());
+    DateTime now = DateTime.UtcNow;
+    tray.Accept(new[] { Sample("/test/gone", 1f, now), Sample("/test/kept", 2f, now) });
+    tray.Rebuild(new[] { Descriptor("/test/kept", "Kept") });
+
+    FieldInfo? latestField = typeof(TrayIconManager).GetField(
+        "_latest", BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(latestField is not null, "Tray manager should hold its latest-value cache in _latest.");
+    var cache = (System.Collections.Concurrent.ConcurrentDictionary<string, float?>)latestField!.GetValue(tray)!;
+    Check.True(!cache.ContainsKey("/test/gone"),
+        "A descriptor rebuild should prune values for sensors that no longer exist.");
+    Check.True(cache.ContainsKey("/test/kept"),
+        "A descriptor rebuild must keep values that are still described.");
 }
 
 static void IntelThermalStatusDecodeTests()
@@ -693,6 +846,34 @@ static SensorDescriptor Descriptor(string id, string name) => new()
     Category = SensorCategory.Storage,
     Quantity = SensorQuantity.Temperature,
 };
+
+/// <summary>
+/// Stands in for the app's SyncWindow: the harness has no message loop, so marshaled work runs
+/// inline. InvokeRequired is false, which is exactly the state TrayIconManager.Rebuild takes as
+/// "already on the UI thread".
+/// </summary>
+sealed class ImmediateSync : ISynchronizeInvoke
+{
+    public bool InvokeRequired => false;
+
+    public IAsyncResult BeginInvoke(Delegate method, object?[]? args)
+    {
+        method.DynamicInvoke(args);
+        return new Completed();
+    }
+
+    public object? EndInvoke(IAsyncResult result) => null;
+
+    public object? Invoke(Delegate method, object?[]? args) => method.DynamicInvoke(args);
+
+    private sealed class Completed : IAsyncResult
+    {
+        public object? AsyncState => null;
+        public WaitHandle AsyncWaitHandle => new ManualResetEvent(true);
+        public bool CompletedSynchronously => true;
+        public bool IsCompleted => true;
+    }
+}
 
 static class Check
 {

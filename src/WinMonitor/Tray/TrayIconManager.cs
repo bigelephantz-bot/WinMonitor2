@@ -54,8 +54,9 @@ public sealed class TrayIconManager : IDisposable
     private const int MaxTooltipLength = 63;                  // hard shell limit for NotifyIcon.Text
     private const int SparklineSamples = 32;                  // last-N history points drawn in the tray sparkline
 
-    // State colors come from Theme.Good/Warn/Hot so the tray matches the rest of the app
-    // (the halo drawn by IconRenderer keeps them readable on light and dark taskbars).
+    // State colors come from Theme.Good/Warn/Hot so the tray matches the rest of the app.
+    // Legibility on light and dark taskbars comes from IconRenderer's glyph sizing and hinting,
+    // not from an outline — see the tray rendering notes in ARCHITECTURE.md before changing these.
     // Only the "no data" neutrals stay local.
     private static readonly Color NeutralGray = Color.FromArgb(170, 170, 170);
     private static readonly Color NeutralBadge = Color.FromArgb(96, 96, 96);
@@ -180,6 +181,25 @@ public sealed class TrayIconManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Drops cached values whose sensor no longer exists. <see cref="_latest"/> is written by the
+    /// poll thread for every id it sees and read only through the current descriptors, so without
+    /// this a rescan that renames or removes ids — hot-plug, an EC sensor edit, a resumed machine
+    /// re-enumerating hardware — leaves entries behind that nothing will ever read again. Cold
+    /// rebuild path only: the per-tick <see cref="Accept"/> path stays allocation-free.
+    /// A value the poll thread writes concurrently for a dropped id is simply re-added and pruned
+    /// at the next rebuild, so no lock is needed.
+    /// </summary>
+    private static void PruneStaleValues(ConcurrentDictionary<string, float?> latest,
+        IReadOnlyList<SensorDescriptor> descriptors)
+    {
+        if (latest.IsEmpty) return;
+        var live = new HashSet<string>(descriptors.Count, StringComparer.Ordinal);
+        for (int i = 0; i < descriptors.Count; i++) live.Add(descriptors[i].Id);
+        foreach (string id in latest.Keys)
+            if (!live.Contains(id)) latest.TryRemove(id, out _);
+    }
+
     private void OnRedrawMarshaled()
     {
         // Clear the flag BEFORE redrawing so a bg tick arriving mid-redraw queues the next one.
@@ -206,6 +226,7 @@ public sealed class TrayIconManager : IDisposable
     {
         if (_disposed) return;
         _descriptors = descriptors;
+        PruneStaleValues(_latest, descriptors);
         _thresholdCache.Clear();
         RefreshMenuText();   // picks up language changes applied via settings
 
