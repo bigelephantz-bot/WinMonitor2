@@ -13,12 +13,21 @@ namespace WinMonitor.Core;
 ///
 /// All access is serialized on the shared "Global\Access_EC" mutex (create-or-open, the
 /// WinRing0 / LibreHardwareMonitor convention) so we never race the Windows ACPI driver, which
-/// also drives these ports on GPE/EC-query events.
+/// also drives these ports on GPE/EC-query events. That exact name is the whole point of the
+/// mutex: a session-local "Access_EC" is a different kernel object and would synchronize us
+/// against nobody. If it cannot be had, the EC stays unavailable — unsynchronized port access
+/// interleaved with ACPI.sys corrupts both sides' handshakes.
 ///
-/// Every block read carries a small total-time budget: the EC can wedge (ACPI driver contention,
-/// S3/Modern-Standby resume), and an unbounded busy-spin would otherwise freeze the poll thread
-/// or the UI. When the budget is exhausted the remaining registers are simply reported as
-/// "not read" (ok=false → the sensor shows "—") rather than stalling.
+/// Every read carries a total-time budget covering every wait it performs — the managed lock,
+/// the shared mutex, the OBF drain and the register handshakes all draw from the same clock, so
+/// a 40 ms call cannot spend 200 ms acquiring a mutex. When the budget is exhausted the remaining
+/// registers are reported as "not read" (ok=false → the sensor shows "—") rather than stalling.
+///
+/// The budget bounds our own waiting; it cannot bound the kernel. The batch therefore runs on a
+/// <see cref="NativeCallGate"/>, so a PawnIO IOCTL that never returns costs the poll thread its
+/// timeout rather than the rest of the session. A wedged call keeps the PawnIO handle and the
+/// mutex forever, so the EC is disabled for the process and those objects are deliberately never
+/// disposed.
 /// </summary>
 public sealed class EmbeddedController : IDisposable
 {
@@ -32,10 +41,16 @@ public sealed class EmbeddedController : IDisposable
     private const int WaitStatusMaxMs = 10;      // per-handshake-step ceiling (was 100)
     private const int DefaultBudgetMs = 40;      // per block-read total budget (poll thread)
     private const int ExplorerBudgetMs = 250;    // longer budget for the off-thread EC Explorer dump
+    // Headroom over the budget before a call counts as wedged rather than merely slow: the batch
+    // bounds its own waiting, so overshooting this can only mean a native call that did not return.
+    private const int GateMarginMs = 250;
+    private const int OpenGateTimeoutMs = 5000;  // driver open + module load, once per session
 
     private const string ModuleFileName = "LpcACPIEC.bin";
+    private const string SharedMutexName = "Global\\Access_EC";
 
     private readonly object _lock = new();
+    private readonly NativeCallGate _gate = new("EcAccess");
     private PawnIo? _pawn;
     private Mutex? _ecMutex;
     private bool _disposed;
@@ -55,6 +70,13 @@ public sealed class EmbeddedController : IDisposable
         {
             if (_disposed) return false;
             if (Available && _pawn is not null) return true;
+            if (_gate.Wedged)
+            {
+                // A previous call never returned; the gate accepts no work and the driver handle
+                // it owns cannot be reopened safely.
+                UnavailableReason = "ec_wedged";
+                return false;
+            }
             ResetConnectionLocked();
 
             if (!PawnIo.LibraryPresent)
@@ -76,26 +98,51 @@ public sealed class EmbeddedController : IDisposable
             try { blob = File.ReadAllBytes(modulePath); }
             catch { UnavailableReason = "module_unreadable"; return false; }
 
+            // Open and load also cross the driver boundary, and they run on the poll thread during
+            // a rescan or a resume — the same isolation applies.
             var pawn = new PawnIo();
-            int hr = pawn.Open();
-            if (hr != 0)
+            int openHr = 0;
+            int loadHr = 0;
+            if (!_gate.TryRun(() =>
+                {
+                    openHr = pawn.Open();
+                    if (openHr == 0) loadHr = pawn.Load(blob);
+                }, OpenGateTimeoutMs))
             {
-                pawn.Dispose();
-                // 0x80070005 = E_ACCESSDENIED (not elevated / driver not permitting).
-                UnavailableReason = hr == unchecked((int)0x80070005) ? "not_elevated" : "open_failed";
+                // The call is still running and owns `pawn`; disposing it here would tear the
+                // handle out from under it.
+                UnavailableReason = "ec_wedged";
                 return false;
             }
 
-            hr = pawn.Load(blob);
-            if (hr != 0)
+            if (openHr != 0)
+            {
+                pawn.Dispose();
+                // 0x80070005 = E_ACCESSDENIED (not elevated / driver not permitting).
+                UnavailableReason = openHr == unchecked((int)0x80070005) ? "not_elevated" : "open_failed";
+                return false;
+            }
+
+            if (loadHr != 0)
             {
                 pawn.Dispose();
                 UnavailableReason = "load_failed";
                 return false;
             }
 
+            _ecMutex = TryOpenSharedMutex();
+            if (_ecMutex is null)
+            {
+                // Fail closed. Reading the EC ports without holding the shared mutex races the
+                // ACPI driver mid-transaction and corrupts both sides' handshakes; a wrong fan
+                // reading is the mild outcome.
+                pawn.Dispose();
+                UnavailableReason = "ec_mutex_unavailable";
+                Diag.Log("ec", "EC disabled: " + SharedMutexName + " could not be created or opened");
+                return false;
+            }
+
             _pawn = pawn;
-            TryOpenEcMutex();
             Available = true;
             UnavailableReason = null;
             return true;
@@ -118,31 +165,13 @@ public sealed class EmbeddedController : IDisposable
     public byte[] ReadBlock(int start, int count, out bool[] ok, int budgetMs = DefaultBudgetMs)
     {
         var data = new byte[count < 0 ? 0 : count];
-        ok = new bool[data.Length];
+        var flags = new bool[data.Length];
+        ok = flags;
         if (data.Length == 0) return data;
 
-        lock (_lock)
-        {
-            if (!Available || _pawn is null) return data;
-            var sw = Stopwatch.StartNew();
-            bool held = AcquireEcMutex(out _);
-            if (_ecMutex is not null && !held) return data;
-            try
-            {
-                DrainObf();
-                for (int i = 0; i < data.Length; i++)
-                {
-                    int addr = start + i;
-                    if ((uint)addr > 0xFF) continue;
-                    if (sw.ElapsedMilliseconds >= budgetMs) break;   // budget exhausted -> rest stay ok=false
-                    if (TryReadRegisterNoMutex(addr, sw, budgetMs, out byte v)) { data[i] = v; ok[i] = true; }
-                }
-            }
-            finally
-            {
-                if (held) ReleaseEcMutex();
-            }
-        }
+        var addrs = new int[data.Length];
+        for (int i = 0; i < addrs.Length; i++) addrs[i] = start + i;
+        RunRead(addrs, data, flags, budgetMs);
         return data;
     }
 
@@ -154,45 +183,90 @@ public sealed class EmbeddedController : IDisposable
     public byte[] ReadRegisters(int[] addrs, out bool[] ok, int budgetMs = DefaultBudgetMs)
     {
         var data = new byte[addrs.Length];
-        ok = new bool[addrs.Length];
+        var flags = new bool[addrs.Length];
+        ok = flags;
         if (addrs.Length == 0) return data;
-
-        lock (_lock)
-        {
-            if (!Available || _pawn is null) return data;
-            var sw = Stopwatch.StartNew();
-            bool held = AcquireEcMutex(out _);
-            if (_ecMutex is not null && !held) return data;
-            try
-            {
-                DrainObf();
-                for (int i = 0; i < addrs.Length; i++)
-                {
-                    int addr = addrs[i];
-                    if ((uint)addr > 0xFF) continue;
-                    if (sw.ElapsedMilliseconds >= budgetMs) break;
-                    if (TryReadRegisterNoMutex(addr, sw, budgetMs, out byte v)) { data[i] = v; ok[i] = true; }
-                }
-            }
-            finally
-            {
-                if (held) ReleaseEcMutex();
-            }
-        }
+        RunRead(addrs, data, flags, budgetMs);
         return data;
     }
 
     /// <summary>Full 256-byte dump for the EC Explorer (longer budget; call off the UI thread).</summary>
     public byte[] Dump(out bool[] ok) => ReadBlock(0, 256, out ok, ExplorerBudgetMs);
 
-    // ---------- internals (all called under _lock) ----------
+    // ---------- internals ----------
+
+    /// <summary>
+    /// Serializes, budgets and isolates one read batch. The stopwatch starts before the managed
+    /// lock so every wait in the call — not merely the register handshakes — draws from the same
+    /// budget. Entries stay ok=false whenever the budget runs out.
+    /// </summary>
+    private void RunRead(int[] addrs, byte[] data, bool[] flags, int budgetMs)
+    {
+        var sw = Stopwatch.StartNew();
+        if (!Monitor.TryEnter(_lock, Remaining(sw, budgetMs))) return;
+        try
+        {
+            if (_disposed || !Available || _pawn is null) return;
+            // The gate runs the batch on its own thread, so a PawnIO IOCTL that never returns
+            // costs this caller the timeout instead of the rest of the session.
+            if (!_gate.TryRun(() => ReadBatch(addrs, data, flags, sw, budgetMs), budgetMs + GateMarginMs))
+                MarkWedgedLocked();
+        }
+        finally
+        {
+            Monitor.Exit(_lock);
+        }
+    }
+
+    /// <summary>Runs on the gate's thread: acquires the shared mutex and walks the registers.</summary>
+    private void ReadBatch(int[] addrs, byte[] data, bool[] flags, Stopwatch sw, int budgetMs)
+    {
+        // The mutex is thread-affine and is both taken and released here, so the shared lock is
+        // never left owned by a thread that has moved on.
+        if (!AcquireEcMutex(Remaining(sw, budgetMs))) return;
+        try
+        {
+            DrainObf(sw, budgetMs);
+            for (int i = 0; i < addrs.Length; i++)
+            {
+                int addr = addrs[i];
+                if ((uint)addr > 0xFF) continue;
+                if (sw.ElapsedMilliseconds >= budgetMs) break;   // budget exhausted -> rest stay ok=false
+                if (TryReadRegisterNoMutex(addr, sw, budgetMs, out byte v)) { data[i] = v; flags[i] = true; }
+            }
+        }
+        finally
+        {
+            ReleaseEcMutex();
+        }
+    }
+
+    private static int Remaining(Stopwatch sw, int budgetMs)
+    {
+        long left = budgetMs - sw.ElapsedMilliseconds;
+        return left <= 0 ? 0 : (int)left;
+    }
+
+    /// <summary>
+    /// Records that a native call never returned. The abandoned call still owns the PawnIO handle
+    /// and the shared mutex, so neither is disposed here or later — see <see cref="NativeCallGate"/>.
+    /// </summary>
+    private void MarkWedgedLocked()
+    {
+        if (!Available) return;
+        Available = false;
+        UnavailableReason = "ec_wedged";
+        Diag.Log("ec", "EC read did not return; EC sensors disabled for this session "
+            + "(driver handle and " + SharedMutexName + " left to the abandoned call)");
+    }
 
     /// <summary>
     /// Discards a byte the EC/ACPI driver may have left in the output buffer before we start our
     /// own handshake, so the first register read cannot return a stale query/burst byte.
     /// </summary>
-    private void DrainObf()
+    private void DrainObf(Stopwatch sw, int budgetMs)
     {
+        if (sw.ElapsedMilliseconds >= budgetMs) return;
         if (ReadPort(EC_SC, out byte status) && (status & STATUS_OBF) != 0)
             ReadPort(EC_DATA, out _);
     }
@@ -249,24 +323,31 @@ public sealed class EmbeddedController : IDisposable
         return hr == 0;
     }
 
-    private void TryOpenEcMutex()
+    /// <summary>
+    /// Create-or-open (CreateMutex semantics) on the shared name. The mutex usually does NOT
+    /// pre-exist, so OpenExisting alone would leave us unsynchronized against ACPI.sys; `new Mutex`
+    /// creates it if absent and attaches to a peer's if present.
+    ///
+    /// There is deliberately no fallback. An unprefixed "Access_EC" lives in the session namespace
+    /// and is a different kernel object from the Global one every other tool uses, so falling back
+    /// to it would look synchronized while synchronizing against nothing. Returning null makes the
+    /// caller disable the EC instead.
+    /// </summary>
+    private static Mutex? TryOpenSharedMutex()
     {
-        // Create-or-open (CreateMutex semantics): the shared "Access_EC" mutex usually does NOT
-        // pre-exist, so OpenExisting alone would leave us unsynchronized against ACPI.sys. new
-        // Mutex creates it if absent and attaches to a peer's if present. Try the Global (session-
-        // wide) name first — matches WinRing0 / LibreHardwareMonitor — then a session-local name.
-        try { _ecMutex = new Mutex(false, "Global\\Access_EC"); return; }
-        catch { /* Global namespace may be denied; fall back */ }
-        try { _ecMutex = new Mutex(false, "Access_EC"); }
-        catch { _ecMutex = null; } // last resort: proceed unsynchronized (best effort)
+        try { return new Mutex(false, SharedMutexName); }
+        catch (Exception ex)
+        {
+            Diag.Log("ec", "Opening " + SharedMutexName + " failed", ex);
+            return null;
+        }
     }
 
-    private bool AcquireEcMutex(out bool abandoned)
+    private bool AcquireEcMutex(int waitMs)
     {
-        abandoned = false;
         if (_ecMutex is null) return false;
-        try { return _ecMutex.WaitOne(200); }
-        catch (AbandonedMutexException) { abandoned = true; return true; } // we now own it
+        try { return _ecMutex.WaitOne(waitMs); }
+        catch (AbandonedMutexException) { return true; } // previous owner died; we own it now
         catch { return false; }
     }
 
@@ -289,6 +370,16 @@ public sealed class EmbeddedController : IDisposable
     private void ResetConnectionLocked()
     {
         Available = false;
+        if (_gate.Wedged)
+        {
+            // An abandoned native call still owns both. Disposing a handle or a mutex under a live
+            // kernel call is not a tidy-up, it is a use-after-free — drop the references only.
+            Diag.Log("ec", "EC worker wedged; leaving the driver handle and "
+                + SharedMutexName + " to process exit");
+            _ecMutex = null;
+            _pawn = null;
+            return;
+        }
         try { _ecMutex?.Dispose(); } catch { }
         _ecMutex = null;
         try { _pawn?.Dispose(); } catch { }
@@ -303,5 +394,6 @@ public sealed class EmbeddedController : IDisposable
             _disposed = true;
             ResetConnectionLocked();
         }
+        _gate.Dispose();
     }
 }

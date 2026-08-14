@@ -427,15 +427,20 @@ public sealed class TrayIconManager : IDisposable
                 ? Color.White
                 : state;
 
+            // `next` is an unowned HICON until the slot accepts it. If assigning it to the shell
+            // throws — GDI pressure, a shell hiccup — nothing else can ever reach that handle, so
+            // the failure path has to destroy it rather than just keep the old icon on screen.
+            Icon? next = null;
             try
             {
-                var next = wantSpark
+                next = wantSpark
                     ? IconRenderer.RenderTextWithSparkline(text, fg, bg, slot.Cfg.Bold,
                         new ReadOnlySpan<float>(slot.SparkBuffer, 0, slot.SparkCount), lineColor)
                     : IconRenderer.RenderText(text, fg, bg, slot.Cfg.Bold);
                 var previous = slot.CurrentIcon;
                 slot.Icon.Icon = next;   // the shell copies the icon; the old HICON can go now
                 slot.CurrentIcon = next;
+                next = null;             // ownership transferred to the slot
                 if (previous is not null) IconRenderer.ReleaseIcon(previous);
                 slot.LastText = text;
                 slot.LastColor = state;
@@ -446,6 +451,10 @@ public sealed class TrayIconManager : IDisposable
             catch (Exception)
             {
                 // GDI pressure or shell hiccup: keep showing the previous icon.
+            }
+            finally
+            {
+                if (next is not null) IconRenderer.ReleaseIcon(next);
             }
         }
 
@@ -793,17 +802,22 @@ public sealed class TrayIconManager : IDisposable
         _menuBoldFont.Dispose();
     }
 
+    /// <summary>
+    /// Releases everything a slot owns. Each shell call is isolated: a NotifyIcon that throws on
+    /// detach or dispose must not carry the HICON release down with it, since that handle is the
+    /// one resource nothing else will ever reclaim.
+    /// </summary>
     private static void DisposeSlot(IconSlot slot)
     {
         if (slot.RotateTimer is not null)
         {
-            slot.RotateTimer.Stop();
-            slot.RotateTimer.Dispose();
+            try { slot.RotateTimer.Stop(); } catch (Exception) { }
+            try { slot.RotateTimer.Dispose(); } catch (Exception) { }
             slot.RotateTimer = null;
         }
         try { slot.Icon.Visible = false; } catch (Exception) { }
-        slot.Icon.Icon = null;    // detach from the shell wrapper before destroying the HICON
-        slot.Icon.Dispose();
+        try { slot.Icon.Icon = null; } catch (Exception) { }  // detach before destroying the HICON
+        try { slot.Icon.Dispose(); } catch (Exception) { }
         if (slot.CurrentIcon is not null)
         {
             IconRenderer.ReleaseIcon(slot.CurrentIcon);

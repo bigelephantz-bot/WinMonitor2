@@ -27,6 +27,9 @@ var tests = new (string Name, Action Run)[]
     (nameof(LoggingCompletenessTests), LoggingCompletenessTests),
     (nameof(PollThreadLifetimeTests), PollThreadLifetimeTests),
     (nameof(TrayLatestValuePruneTests), TrayLatestValuePruneTests),
+    (nameof(NativeCallGateTests), NativeCallGateTests),
+    (nameof(EcMutexFailClosedTests), EcMutexFailClosedTests),
+    (nameof(IconHandleOwnershipTests), IconHandleOwnershipTests),
 };
 
 int failures = 0;
@@ -463,6 +466,131 @@ static void TrayLatestValuePruneTests()
         "A descriptor rebuild should prune values for sensors that no longer exist.");
     Check.True(cache.ContainsKey("/test/kept"),
         "A descriptor rebuild must keep values that are still described.");
+}
+
+/// <summary>
+/// A native call that never returns cannot be cancelled, so the gate's contract is that the
+/// *caller* stops waiting and nothing the abandoned call owns is ever reclaimed. Uses a blocking
+/// delegate rather than hardware, so the wedge is deterministic.
+/// </summary>
+static void NativeCallGateTests()
+{
+    using var gate = new NativeCallGate("TestGate");
+    int completed = 0;
+
+    Check.True(gate.TryRun(() => completed++, 5000), "A prompt call should complete.");
+    Check.Equal(1, completed, "The delegate should have run exactly once.");
+    Check.True(!gate.Wedged, "A completed call must not close the gate.");
+
+    // An exception inside the delegate is the caller's business, not a gate failure.
+    Check.True(gate.TryRun(() => throw new InvalidOperationException("boom"), 5000),
+        "A delegate that throws still counts as returned.");
+    Check.True(!gate.Wedged, "A throwing delegate must not close the gate.");
+
+    using var release = new ManualResetEventSlim(false);
+    using var entered = new ManualResetEventSlim(false);
+    try
+    {
+        Check.True(!gate.TryRun(() => { entered.Set(); release.Wait(); }, 100),
+            "A call that outlives its timeout must report failure.");
+        Check.True(entered.Wait(TimeSpan.FromSeconds(10)), "The wedged delegate should have started.");
+        Check.True(gate.Wedged, "A timed-out call must close the gate.");
+
+        // Fail fast afterwards: queueing behind a thread that will never return is the failure
+        // mode the gate exists to prevent.
+        int afterWedge = 0;
+        Check.True(!gate.TryRun(() => afterWedge++, 5000), "A closed gate must accept no further work.");
+        Check.Equal(0, afterWedge, "A closed gate must not run the delegate.");
+    }
+    finally
+    {
+        release.Set();
+    }
+}
+
+/// <summary>
+/// The shared "Global\Access_EC" mutex is what keeps EC port access from interleaving with the
+/// ACPI driver. A session-local "Access_EC" is a different kernel object, so falling back to it
+/// would synchronize against nothing — the EC must stay unavailable instead.
+/// </summary>
+static void EcMutexFailClosedTests()
+{
+    Type type = typeof(EmbeddedController);
+    Check.True(type.GetMethod("TryOpenEcMutex", BindingFlags.Instance | BindingFlags.NonPublic) is null,
+        "The fallback mutex opener should be gone, not merely unused.");
+
+    MethodInfo? open = type.GetMethod("TryOpenSharedMutex", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(open is not null, "A shared-mutex opener should exist.");
+    Check.True(open!.ReturnType == typeof(Mutex), "The opener should report failure by returning null.");
+
+    FieldInfo? nameField = type.GetField("SharedMutexName", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(nameField is not null, "The shared mutex name should be a single named constant.");
+    Check.Equal("Global\\Access_EC", (string)nameField!.GetRawConstantValue()!,
+        "EC access must use the Global namespace every other tool uses.");
+
+    // No source path may perform EC work without the mutex: the opener is the only producer, and
+    // Initialize is the only consumer, so an unavailable mutex has to leave the EC off.
+    string source = ReadRepositoryFile("src/WinMonitor/Core/EmbeddedController.cs");
+    Check.True(!source.Contains("new Mutex(false, \"Access_EC\")", StringComparison.Ordinal),
+        "A session-local Access_EC fallback must not be reintroduced.");
+    Check.True(source.Contains("ec_mutex_unavailable", StringComparison.Ordinal),
+        "Failing to obtain the shared mutex should surface a reason.");
+    Check.True(!source.Contains("_ecMutex is not null && !held", StringComparison.Ordinal),
+        "Reads must not treat a missing mutex as permission to proceed unsynchronized.");
+
+    // A real acquisition still has to work, and the budget must bound the wait rather than
+    // spending a fixed 200 ms on a contended mutex.
+    MethodInfo? acquire = type.GetMethod("AcquireEcMutex", BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(acquire is not null, "The mutex acquisition helper should exist.");
+    ParameterInfo[] parameters = acquire!.GetParameters();
+    Check.Equal(1, parameters.Length, "Acquisition should take the remaining budget.");
+    Check.True(parameters[0].ParameterType == typeof(int), "The remaining budget should be milliseconds.");
+
+    using var controller = new EmbeddedController();
+    Check.True(!controller.Available, "A controller with no driver must not report itself available.");
+    controller.ReadRegisters(new[] { 0xB0 }, out bool[] ok);
+    Check.True(ok.Length == 1 && !ok[0], "An unavailable controller must report every register as unread.");
+}
+
+/// <summary>
+/// Every HICON that <see cref="IconRenderer"/> hands out has to reach exactly one DestroyIcon.
+/// The interesting cases are the failure paths, where nothing else can still own the handle.
+/// </summary>
+static void IconHandleOwnershipTests()
+{
+    MethodInfo? release = typeof(IconRenderer).GetMethod(
+        "ReleaseHandle", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(release is not null,
+        "A raw-handle release path should exist for HICONs that never reach a wrapper.");
+
+    // A zero handle is what a failed GetHicon yields; releasing it must be a no-op, not a throw.
+    release!.Invoke(null, new object[] { IntPtr.Zero });
+
+    // Round-trip a real icon: rendering then releasing must not throw, and the wrapper must be
+    // disposed by the release (its handle is destroyed, so touching it afterwards is invalid).
+    Icon icon = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false);
+    Check.True(icon.Handle != IntPtr.Zero, "A rendered icon should carry a live handle.");
+    IconRenderer.ReleaseIcon(icon);
+
+    string renderer = ReadRepositoryFile("src/WinMonitor/Tray/IconRenderer.cs");
+    Check.True(renderer.Contains("ReleaseHandle(hIcon)", StringComparison.Ordinal),
+        "The GetHicon/FromHandle window must destroy the handle if wrapping fails.");
+
+    string tray = ReadRepositoryFile("src/WinMonitor/Tray/TrayIconManager.cs");
+    Check.True(tray.Contains("if (next is not null) IconRenderer.ReleaseIcon(next);", StringComparison.Ordinal),
+        "An icon the shell refused must be released, not dropped.");
+    Check.True(tray.Contains("try { slot.Icon.Dispose(); } catch (Exception) { }", StringComparison.Ordinal),
+        "A NotifyIcon that throws on dispose must not skip the HICON release that follows it.");
+}
+
+/// <summary>Reads a repository source file relative to the solution root.</summary>
+static string ReadRepositoryFile(string relativePath)
+{
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
+    while (dir is not null && !File.Exists(Path.Combine(dir.FullName, relativePath)))
+        dir = dir.Parent;
+    Check.True(dir is not null, $"Should locate {relativePath} above the test output directory.");
+    return File.ReadAllText(Path.Combine(dir!.FullName, relativePath));
 }
 
 static void IntelThermalStatusDecodeTests()
