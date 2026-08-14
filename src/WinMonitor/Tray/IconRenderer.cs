@@ -145,7 +145,17 @@ public static class IconRenderer
                 // disposed immediately (finally below). Icon.FromHandle merely wraps the
                 // handle without owning it — see ReleaseIcon.
                 IntPtr hIcon = bmp.GetHicon();
-                return Icon.FromHandle(hIcon);
+                try
+                {
+                    return Icon.FromHandle(hIcon);
+                }
+                catch
+                {
+                    // The raw HICON is ours from the moment GetHicon returns; if no managed
+                    // wrapper takes ownership, this is the only place it can still be destroyed.
+                    ReleaseHandle(hIcon);
+                    throw;
+                }
             }
             finally
             {
@@ -220,7 +230,17 @@ public static class IconRenderer
         try { handle = icon.Handle; }
         catch (ObjectDisposedException) { /* already disposed elsewhere; nothing to destroy safely */ }
         icon.Dispose();
-        if (handle != IntPtr.Zero) DestroyIcon(handle);
+        ReleaseHandle(handle);
+    }
+
+    /// <summary>
+    /// Destroys a raw HICON that never reached a managed wrapper. Used on the failure path between
+    /// <c>GetHicon</c> and <c>Icon.FromHandle</c>, where nothing else can still own it.
+    /// </summary>
+    private static void ReleaseHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero) return;
+        try { DestroyIcon(handle); } catch { /* teardown must not throw over a lost handle */ }
     }
 
     /// <summary>
