@@ -51,6 +51,25 @@ public sealed class EmbeddedController : IDisposable
 
     private readonly object _lock = new();
     private readonly NativeCallGate _gate = new("EcAccess");
+
+    // Batch buffers owned by the gate thread, never handed to a caller. A timed-out worker keeps
+    // writing into whatever it was given, so the caller's arrays must not be the same objects;
+    // results are copied out only once the gate confirms the batch finished. Reused across batches
+    // (the poll thread reads the same registers every time) and abandoned outright after a wedge,
+    // which also disables the EC, so a reused buffer can never be one a live worker still holds.
+    private byte[] _batchData = Array.Empty<byte>();
+    private bool[] _batchFlags = Array.Empty<bool>();
+    // Port I/O scratch, also gate-thread only: one register read runs several port operations, and
+    // allocating a pair of ulong arrays for each of them was the bulk of this class's garbage.
+    private readonly ulong[] _portInput = new ulong[2];
+    private readonly ulong[] _portOutput = new ulong[1];
+
+    // Driver handle and mutex an abandoned call may still be inside. Holding the references is the
+    // entire point: dropping the last one lets the finalizer close a handle under a live native
+    // call, which is the use-after-free that "leak it deliberately" exists to prevent. Static
+    // because the controller itself may be collected long before the call returns.
+    private static readonly List<object> AbandonedNativeObjects = new();
+
     private PawnIo? _pawn;
     private Mutex? _ecMutex;
     private bool _disposed;
@@ -206,11 +225,30 @@ public sealed class EmbeddedController : IDisposable
         if (!Monitor.TryEnter(_lock, Remaining(sw, budgetMs))) return;
         try
         {
-            if (_disposed || !Available || _pawn is null) return;
-            // The gate runs the batch on its own thread, so a PawnIO IOCTL that never returns
-            // costs this caller the timeout instead of the rest of the session.
-            if (!_gate.TryRun(() => ReadBatch(addrs, data, flags, sw, budgetMs), budgetMs + GateMarginMs))
-                MarkWedgedLocked();
+            if (_disposed || !Available) return;
+            PawnIo? pawn = _pawn;
+            Mutex? mutex = _ecMutex;
+            if (pawn is null || mutex is null) return;
+
+            if (_batchData.Length < addrs.Length)
+            {
+                _batchData = new byte[addrs.Length];
+                _batchFlags = new bool[addrs.Length];
+            }
+            Array.Clear(_batchData, 0, addrs.Length);
+            Array.Clear(_batchFlags, 0, addrs.Length);
+            byte[] workData = _batchData;
+            bool[] workFlags = _batchFlags;
+
+            // The gate runs the batch on its own thread, so a PawnIO IOCTL that never returns costs
+            // this caller the timeout instead of the rest of the session. The handle and mutex are
+            // captured above: a concurrent Reset may clear the fields, but this batch must keep
+            // using — and releasing — the exact objects it started with.
+            bool completed = _gate.TryRun(
+                () => ReadBatch(pawn, mutex, addrs, workData, workFlags, sw, budgetMs),
+                budgetMs + GateMarginMs);
+            PublishBatch(completed, workData, workFlags, data, flags);
+            if (!completed) MarkWedgedLocked(pawn, mutex, workData, workFlags);
         }
         finally
         {
@@ -218,26 +256,42 @@ public sealed class EmbeddedController : IDisposable
         }
     }
 
-    /// <summary>Runs on the gate's thread: acquires the shared mutex and walks the registers.</summary>
-    private void ReadBatch(int[] addrs, byte[] data, bool[] flags, Stopwatch sw, int budgetMs)
+    /// <summary>
+    /// Copies a finished batch out to the caller. Nothing is copied unless the gate confirmed the
+    /// batch returned: an abandoned worker is still writing into the source buffers, and the caller
+    /// hands its arrays straight to the sensor pipeline. Exposed for the regression harness, which
+    /// asserts that a timed-out batch can never change what the caller already received.
+    /// </summary>
+    internal static void PublishBatch(bool completed, byte[] source, bool[] sourceFlags,
+        byte[] data, bool[] flags)
     {
-        // The mutex is thread-affine and is both taken and released here, so the shared lock is
-        // never left owned by a thread that has moved on.
-        if (!AcquireEcMutex(Remaining(sw, budgetMs))) return;
+        if (!completed) return;
+        int count = Math.Min(data.Length, Math.Min(source.Length, Math.Min(flags.Length, sourceFlags.Length)));
+        Array.Copy(source, data, count);
+        Array.Copy(sourceFlags, flags, count);
+    }
+
+    /// <summary>Runs on the gate's thread: acquires the shared mutex and walks the registers.</summary>
+    private void ReadBatch(PawnIo pawn, Mutex mutex, int[] addrs, byte[] data, bool[] flags,
+        Stopwatch sw, int budgetMs)
+    {
+        // Released through the captured reference, not the field: a Reset during a wedged call
+        // clears the field, and a late-returning worker must still release the mutex it took.
+        if (!AcquireEcMutex(mutex, Remaining(sw, budgetMs))) return;
         try
         {
-            DrainObf(sw, budgetMs);
+            DrainObf(pawn, sw, budgetMs);
             for (int i = 0; i < addrs.Length; i++)
             {
                 int addr = addrs[i];
                 if ((uint)addr > 0xFF) continue;
                 if (sw.ElapsedMilliseconds >= budgetMs) break;   // budget exhausted -> rest stay ok=false
-                if (TryReadRegisterNoMutex(addr, sw, budgetMs, out byte v)) { data[i] = v; flags[i] = true; }
+                if (TryReadRegisterNoMutex(pawn, addr, sw, budgetMs, out byte v)) { data[i] = v; flags[i] = true; }
             }
         }
         finally
         {
-            ReleaseEcMutex();
+            try { mutex.ReleaseMutex(); } catch { /* abandoned or already released */ }
         }
     }
 
@@ -248,39 +302,55 @@ public sealed class EmbeddedController : IDisposable
     }
 
     /// <summary>
-    /// Records that a native call never returned. The abandoned call still owns the PawnIO handle
-    /// and the shared mutex, so neither is disposed here or later — see <see cref="NativeCallGate"/>.
+    /// Records that a native call never returned. Everything the abandoned call may still touch is
+    /// pinned for the process lifetime: not disposing is not enough on its own, because dropping
+    /// the last reference lets a finalizer close the same handle the call is inside.
     /// </summary>
-    private void MarkWedgedLocked()
+    private void MarkWedgedLocked(PawnIo pawn, Mutex mutex, byte[] workData, bool[] workFlags)
     {
+        Abandon(pawn);
+        Abandon(mutex);
+        Abandon(workData);
+        Abandon(workFlags);
+        // The worker still owns the batch buffers; a later batch must never write into them.
+        _batchData = Array.Empty<byte>();
+        _batchFlags = Array.Empty<bool>();
+
         if (!Available) return;
         Available = false;
         UnavailableReason = "ec_wedged";
         Diag.Log("ec", "EC read did not return; EC sensors disabled for this session "
-            + "(driver handle and " + SharedMutexName + " left to the abandoned call)");
+            + "(driver handle, " + SharedMutexName + " and its buffers retained for the abandoned call)");
+    }
+
+    /// <summary>Keeps an object alive for the process lifetime because a live native call may use it.</summary>
+    private static void Abandon(object? instance)
+    {
+        if (instance is null) return;
+        lock (AbandonedNativeObjects) AbandonedNativeObjects.Add(instance);
     }
 
     /// <summary>
     /// Discards a byte the EC/ACPI driver may have left in the output buffer before we start our
     /// own handshake, so the first register read cannot return a stale query/burst byte.
     /// </summary>
-    private void DrainObf(Stopwatch sw, int budgetMs)
+    private void DrainObf(PawnIo pawn, Stopwatch sw, int budgetMs)
     {
         if (sw.ElapsedMilliseconds >= budgetMs) return;
-        if (ReadPort(EC_SC, out byte status) && (status & STATUS_OBF) != 0)
-            ReadPort(EC_DATA, out _);
+        if (ReadPort(pawn, EC_SC, out byte status) && (status & STATUS_OBF) != 0)
+            ReadPort(pawn, EC_DATA, out _);
     }
 
     /// <summary>ACPI EC read protocol. Assumes the Access_EC mutex is already held.</summary>
-    private bool TryReadRegisterNoMutex(int address, Stopwatch sw, int budgetMs, out byte value)
+    private bool TryReadRegisterNoMutex(PawnIo pawn, int address, Stopwatch sw, int budgetMs, out byte value)
     {
         value = 0;
-        if (!WaitStatus(STATUS_IBF, desiredSet: false, sw, budgetMs)) return false; // EC not busy
-        if (!WritePort(EC_SC, RD_EC)) return false;                                  // command: read
-        if (!WaitStatus(STATUS_IBF, desiredSet: false, sw, budgetMs)) return false;
-        if (!WritePort(EC_DATA, (byte)address)) return false;                        // send address
-        if (!WaitStatus(STATUS_OBF, desiredSet: true, sw, budgetMs)) return false;   // wait for data
-        if (!ReadPort(EC_DATA, out value)) return false;
+        if (!WaitStatus(pawn, STATUS_IBF, desiredSet: false, sw, budgetMs)) return false; // EC not busy
+        if (!WritePort(pawn, EC_SC, RD_EC)) return false;                                 // command: read
+        if (!WaitStatus(pawn, STATUS_IBF, desiredSet: false, sw, budgetMs)) return false;
+        if (!WritePort(pawn, EC_DATA, (byte)address)) return false;                       // send address
+        if (!WaitStatus(pawn, STATUS_OBF, desiredSet: true, sw, budgetMs)) return false;  // wait for data
+        if (!ReadPort(pawn, EC_DATA, out value)) return false;
         return true;
     }
 
@@ -288,12 +358,12 @@ public sealed class EmbeddedController : IDisposable
     /// Polls the EC status port until the flag reaches the desired state. Bounded by both a
     /// short per-step ceiling and the caller's overall budget, so it can never busy-spin long.
     /// </summary>
-    private bool WaitStatus(byte flag, bool desiredSet, Stopwatch overall, int budgetMs)
+    private bool WaitStatus(PawnIo pawn, byte flag, bool desiredSet, Stopwatch overall, int budgetMs)
     {
         long stepDeadline = overall.ElapsedMilliseconds + WaitStatusMaxMs;
         while (true)
         {
-            if (!ReadPort(EC_SC, out byte status)) return false;
+            if (!ReadPort(pawn, EC_SC, out byte status)) return false;
             if (((status & flag) != 0) == desiredSet) return true;
             long now = overall.ElapsedMilliseconds;
             if (now >= stepDeadline || now >= budgetMs) return false;
@@ -301,25 +371,28 @@ public sealed class EmbeddedController : IDisposable
         }
     }
 
-    private bool ReadPort(int port, out byte value)
+    // Both port helpers run only on the gate thread, inside one batch, so the shared scratch
+    // buffers below are never touched concurrently. Reusing them removes ~10 array allocations
+    // per register read from a path that runs on the poll thread.
+    private bool ReadPort(PawnIo pawn, int port, out byte value)
     {
         value = 0;
-        var input = new ulong[] { (ulong)port };
-        var output = new ulong[1];
-        int hr = _pawn!.Execute("ioctl_pio_read", input, output, out nuint returned);
+        _portInput[0] = (ulong)port;
+        int hr = pawn.Execute("ioctl_pio_read", _portInput, 1, _portOutput, 1, out nuint returned);
         if (hr != 0 || returned < 1) return false;
-        value = (byte)(output[0] & 0xFF);
+        value = (byte)(_portOutput[0] & 0xFF);
         return true;
     }
 
-    private bool WritePort(int port, byte value)
+    private bool WritePort(PawnIo pawn, int port, byte value)
     {
         // Writes here target ONLY the EC command/data ports as part of the read handshake
         // (RD_EC command + address byte). We never issue WR_EC (0x81), so no EC register is modified.
-        // ioctl_pio_write requires out_size==0; Array.Empty is a non-null ref so it pins to a
+        // ioctl_pio_write requires out_size==0; the buffer is still a non-null ref, so it pins to a
         // valid (non-NULL) zero-length pointer, satisfying the module's sized-IOCTL check.
-        var input = new ulong[] { (ulong)port, value };
-        int hr = _pawn!.Execute("ioctl_pio_write", input, Array.Empty<ulong>(), out _);
+        _portInput[0] = (ulong)port;
+        _portInput[1] = value;
+        int hr = pawn.Execute("ioctl_pio_write", _portInput, 2, _portOutput, 0, out _);
         return hr == 0;
     }
 
@@ -343,17 +416,11 @@ public sealed class EmbeddedController : IDisposable
         }
     }
 
-    private bool AcquireEcMutex(int waitMs)
+    private static bool AcquireEcMutex(Mutex mutex, int waitMs)
     {
-        if (_ecMutex is null) return false;
-        try { return _ecMutex.WaitOne(waitMs); }
+        try { return mutex.WaitOne(waitMs); }
         catch (AbandonedMutexException) { return true; } // previous owner died; we own it now
         catch { return false; }
-    }
-
-    private void ReleaseEcMutex()
-    {
-        try { _ecMutex?.ReleaseMutex(); } catch { }
     }
 
     /// <summary>Drops native handles so a hardware rescan/resume can establish a fresh session.</summary>
@@ -373,7 +440,8 @@ public sealed class EmbeddedController : IDisposable
         if (_gate.Wedged)
         {
             // An abandoned native call still owns both. Disposing a handle or a mutex under a live
-            // kernel call is not a tidy-up, it is a use-after-free — drop the references only.
+            // kernel call is not a tidy-up, it is a use-after-free. MarkWedgedLocked already pinned
+            // them, so clearing the fields here cannot make them collectable.
             Diag.Log("ec", "EC worker wedged; leaving the driver handle and "
                 + SharedMutexName + " to process exit");
             _ecMutex = null;

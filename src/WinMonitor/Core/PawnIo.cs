@@ -37,10 +37,22 @@ public sealed class PawnIo : IDisposable
 
     /// <summary>Execute an exported function. Returns HRESULT; <paramref name="returned"/> = out entries written.</summary>
     public int Execute(string name, ulong[] input, ulong[] output, out nuint returned)
+        => Execute(name, input, input.Length, output, output.Length, out returned);
+
+    /// <summary>
+    /// Executes using only the first <paramref name="inputCount"/>/<paramref name="outputCount"/>
+    /// entries, so a caller can reuse one buffer for calls of different arity instead of allocating
+    /// per call. A count of 0 still pins a valid non-NULL pointer, which the modules' sized-IOCTL
+    /// checks require.
+    /// </summary>
+    public int Execute(string name, ulong[] input, int inputCount, ulong[] output, int outputCount,
+        out nuint returned)
     {
         returned = 0;
         if (!IsOpen) return unchecked((int)0x80004005);
-        return pawnio_execute(_handle, name, input, (nuint)input.Length, output, (nuint)output.Length, out returned);
+        if ((uint)inputCount > (uint)input.Length || (uint)outputCount > (uint)output.Length)
+            return unchecked((int)0x80070057); // E_INVALIDARG: never hand the driver a bogus size
+        return pawnio_execute(_handle, name, input, (nuint)inputCount, output, (nuint)outputCount, out returned);
     }
 
     public void Dispose()

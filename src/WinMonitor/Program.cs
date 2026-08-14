@@ -483,24 +483,10 @@ public sealed class WinMonitorContext : ApplicationContext
         });
     }
 
-    private EcExplorerForm? _ecExplorer;
-
-    /// <summary>Opens the Embedded Controller explorer (LG fan discovery). Single instance.</summary>
-    public void ShowEcExplorer(IWin32Window? owner = null)
-    {
-        InvokeOnUi(() =>
-        {
-            if (_ecExplorer is { IsDisposed: false })
-            {
-                _ecExplorer.Activate();
-                return;
-            }
-            try { Sensors.Ec.Initialize(); } catch { }
-            _ecExplorer = new EcExplorerForm(Sensors.Ec, Config.Ec, OnEcSensorsChanged, LatestCpuThermal);
-            _ecExplorer.FormClosed += (_, _) => _ecExplorer = null;
-            _ecExplorer.Show();
-        });
-    }
+    // The EC Explorer used to have a second entry point here that opened it against the LIVE
+    // config. It had no callers once the Diagnostics tab became the only way in, and it
+    // contradicted that path's draft semantics: edits made through it could not be undone by
+    // Cancel. Removed rather than left as a working shortcut back to mutating the live config.
 
     /// <summary>
     /// Stable text form of the EC sensor set, used only to decide whether an Apply actually changed
@@ -518,15 +504,6 @@ public sealed class WinMonitorContext : ApplicationContext
               .Append(':').Append(sensor.Name).Append(':').Append(sensor.Divisor);
         }
         return sb.ToString();
-    }
-
-    private void OnEcSensorsChanged()
-    {
-        // Runs on the UI thread, which owns Config.Ec.Sensors. RefreshEcSensors deep-copies the
-        // list here, so the poll thread only ever sees an immutable snapshot.
-        Config.Ec.Enabled = Config.Ec.Enabled || Config.Ec.Sensors.Count > 0;
-        ConfigStore.Save(Config);
-        Sensors.RefreshEcSensors(Config.Ec);
     }
 
     public void ShowCompact()

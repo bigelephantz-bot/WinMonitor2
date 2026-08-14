@@ -40,6 +40,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(TrayIconMergeTests), TrayIconMergeTests),
     (nameof(WindowIconOwnershipTests), WindowIconOwnershipTests),
     (nameof(TrayCanvasDpiTests), TrayCanvasDpiTests),
+    (nameof(EcTimeoutBufferOwnershipTests), EcTimeoutBufferOwnershipTests),
 };
 
 int failures = 0;
@@ -550,11 +551,14 @@ static void EcMutexFailClosedTests()
 
     // A real acquisition still has to work, and the budget must bound the wait rather than
     // spending a fixed 200 ms on a contended mutex.
-    MethodInfo? acquire = type.GetMethod("AcquireEcMutex", BindingFlags.Instance | BindingFlags.NonPublic);
+    MethodInfo? acquire = type.GetMethod("AcquireEcMutex", BindingFlags.Static | BindingFlags.NonPublic);
     Check.True(acquire is not null, "The mutex acquisition helper should exist.");
     ParameterInfo[] parameters = acquire!.GetParameters();
-    Check.Equal(1, parameters.Length, "Acquisition should take the remaining budget.");
-    Check.True(parameters[0].ParameterType == typeof(int), "The remaining budget should be milliseconds.");
+    Check.Equal(2, parameters.Length, "Acquisition should take the mutex to use and the remaining budget.");
+    // The mutex is passed in, not read from the field: a Reset during a wedged call clears the
+    // field, and the batch still has to release the exact object it acquired.
+    Check.True(parameters[0].ParameterType == typeof(Mutex), "The batch's own mutex should be passed in.");
+    Check.True(parameters[1].ParameterType == typeof(int), "The remaining budget should be milliseconds.");
 
     using var controller = new EmbeddedController();
     Check.True(!controller.Available, "A controller with no driver must not report itself available.");
@@ -969,29 +973,68 @@ static void TrayIconMergeTests()
 /// </summary>
 static void WindowIconOwnershipTests()
 {
-    foreach (Type type in new[] { typeof(SettingsForm), typeof(EcExplorerForm) })
+    // EcExplorerForm is constructible without a running application, so its disposal is checked
+    // for real: build one, dispose it, and prove the icon it extracted was released.
+    using var ec = new EmbeddedController();
+    var form = new EcExplorerForm(ec, new EcConfig(), () => { }, () => (float.NaN, float.NaN));
+    FieldInfo? field = typeof(EcExplorerForm).GetField("_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(field is not null, "EcExplorerForm should retain the icon it extracts.");
+
+    var icon = (Icon?)field!.GetValue(form);
+    form.Dispose();
+    if (icon is not null)
     {
-        FieldInfo? field = type.GetField("_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
-        Check.True(field is not null, $"{type.Name} should retain the icon it extracts.");
-        Check.True(field!.FieldType == typeof(Icon), $"{type.Name}'s window icon field should be an Icon.");
-
-        MethodInfo? dispose = type.GetMethod("Dispose", BindingFlags.Instance | BindingFlags.NonPublic,
-            binder: null, new[] { typeof(bool) }, modifiers: null);
-        Check.True(dispose is not null && dispose.DeclaringType == type,
-            $"{type.Name} should override Dispose(bool) to release it.");
+        bool released = false;
+        try { _ = icon.Handle; } catch (ObjectDisposedException) { released = true; }
+        Check.True(released, "Disposing the form must release the icon it owns.");
     }
+    Check.True(field.GetValue(form) is null, "Disposal should clear the owned icon reference.");
 
-    // The behaviour itself: an extracted icon is a live handle, and disposing it must invalidate it.
-    Icon? icon = null;
-    try { icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
-    catch { /* no shell icon available; the structural checks above still hold */ }
-    if (icon is null) return;
+    // SettingsForm needs a live WinMonitorContext (which opens hardware), so its identical pattern
+    // is only guarded structurally. This is a shape check, not proof that disposal releases.
+    FieldInfo? settingsField = typeof(SettingsForm).GetField(
+        "_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(settingsField is not null, "SettingsForm should retain the icon it extracts.");
+    Check.True(settingsField!.FieldType == typeof(Icon), "SettingsForm's window icon field should be an Icon.");
+    MethodInfo? dispose = typeof(SettingsForm).GetMethod("Dispose", BindingFlags.Instance | BindingFlags.NonPublic,
+        binder: null, new[] { typeof(bool) }, modifiers: null);
+    Check.True(dispose is not null && dispose.DeclaringType == typeof(SettingsForm),
+        "SettingsForm should override Dispose(bool) to release it.");
+}
 
-    Check.True(icon.Handle != IntPtr.Zero, "An extracted icon should carry a live handle.");
-    icon.Dispose();
-    bool disposed = false;
-    try { _ = icon.Handle; } catch (ObjectDisposedException) { disposed = true; }
-    Check.True(disposed, "Disposing an extracted icon should release it.");
+/// <summary>
+/// A timed-out EC batch is still running and still owns its buffers. Whatever it writes afterwards
+/// must never reach the caller, whose arrays go straight into the sensor pipeline.
+/// </summary>
+static void EcTimeoutBufferOwnershipTests()
+{
+    MethodInfo? publish = typeof(EmbeddedController).GetMethod(
+        "PublishBatch", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(publish is not null, "The batch publish step should exist.");
+
+    var workerData = new byte[] { 0x11, 0x22 };
+    var workerFlags = new[] { true, true };
+    var callerData = new byte[2];
+    var callerFlags = new bool[2];
+
+    // Timed out: nothing is published, and a late write by the worker changes nothing.
+    publish!.Invoke(null, new object[] { false, workerData, workerFlags, callerData, callerFlags });
+    Check.True(!callerFlags[0] && !callerFlags[1], "A timed-out batch must report nothing as read.");
+    workerData[0] = 0x99;
+    Check.Equal((byte)0, callerData[0], "A late worker write must not reach the caller's buffer.");
+
+    // Completed: results are copied, and the caller's arrays remain its own afterwards.
+    publish.Invoke(null, new object[] { true, workerData, workerFlags, callerData, callerFlags });
+    Check.Equal((byte)0x99, callerData[0], "A completed batch should publish its values.");
+    Check.True(callerFlags[0] && callerFlags[1], "A completed batch should publish its flags.");
+    workerData[1] = 0x77;
+    Check.Equal((byte)0x22, callerData[1], "Publishing must copy, not alias, the worker's buffer.");
+
+    // An unavailable controller must still leave the caller's arrays untouched and all-false.
+    using var controller = new EmbeddedController();
+    byte[] values = controller.ReadRegisters(new[] { 0xB0, 0xB1 }, out bool[] ok);
+    Check.True(!ok[0] && !ok[1], "An unavailable EC reports every register as unread.");
+    Check.True(values[0] == 0 && values[1] == 0, "An unavailable EC returns no values.");
 }
 
 /// <summary>
@@ -1005,17 +1048,21 @@ static void TrayCanvasDpiTests()
 
     try
     {
+        // ReleaseIcon, never `using`: Icon.FromHandle does not own its HICON, so disposing the
+        // wrapper alone leaks the handle — the very rule these checks exist to protect.
         IconRenderer.SetCanvasSizeProviderForTests(() => 24);
         Check.Equal(24, IconRenderer.CurrentCanvasSize, "A changed shell metric should be adopted.");
-        using (Icon larger = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false))
-            Check.Equal(new Size(24, 24), larger.Size, "Icons should render at the new canvas size.");
+        Icon larger = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false);
+        Check.Equal(new Size(24, 24), larger.Size, "Icons should render at the new canvas size.");
+        IconRenderer.ReleaseIcon(larger);
         Check.True(!IconRenderer.RefreshMetrics(), "An unchanged metric must not force a re-render.");
 
         IconRenderer.SetCanvasSizeProviderForTests(() => 16);
         Check.Equal(16, IconRenderer.CurrentCanvasSize, "A later change should be adopted too.");
-        using (Icon smaller = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false))
-            Check.Equal(new Size(16, 16), smaller.Size,
-                "Font and path caches sized against the old canvas must be rebuilt, not reused.");
+        Icon smaller = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false);
+        Check.Equal(new Size(16, 16), smaller.Size,
+            "Font and path caches sized against the old canvas must be rebuilt, not reused.");
+        IconRenderer.ReleaseIcon(smaller);
     }
     finally
     {
