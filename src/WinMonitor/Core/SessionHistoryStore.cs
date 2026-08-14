@@ -24,6 +24,12 @@ internal sealed class SessionHistoryReadSnapshot : IDisposable
 
     public string[] SensorIds { get; }
 
+    /// <summary>
+    /// False when no spool could be opened at all. An export must fail loudly rather than write a
+    /// header-only file: "no rows" and "the history is unreadable" look identical in a CSV.
+    /// </summary>
+    public bool IsReadable => _stream is not null;
+
     public IEnumerable<SessionHistoryRecord> ReadRecords()
     {
         if (_stream is null) yield break;
@@ -65,6 +71,7 @@ internal sealed class SessionHistoryStore : IDisposable
 {
     private const string FilePrefix = "WinMonitor-session-";
     private const string FileExtension = ".bin";
+    private const int RecordSize = sizeof(long) + sizeof(int) + sizeof(float);
 
     /// <summary>Hard cap for one session's spool. Reaching it stops appending, never throws.</summary>
     private const long MaxBytes = 256L * 1024 * 1024;
@@ -160,26 +167,53 @@ internal sealed class SessionHistoryStore : IDisposable
             _writer.Write(utcTimestamp.ToUniversalTime().Ticks);
             _writer.Write(sensorIndex);
             _writer.Write(value);
-            _bytesWritten += sizeof(long) + sizeof(int) + sizeof(float);
+            // Advanced only after a whole record: this is what makes the retained prefix in
+            // Capture record-aligned when a later write fails part-way through.
+            _bytesWritten += RecordSize;
         }
         catch (Exception ex)
         {
             _faulted = true;
+            // Closing releases the handle but keeps the file: everything written before this
+            // point is still exportable (see Capture).
             CloseWriter();
-            Diag.Log("history", "Session spool write failed; history export stops here", ex);
+            Diag.Log("history", "Session spool write failed; keeping the "
+                + (_bytesWritten / RecordSize) + " record(s) already written", ex);
         }
     }
 
+    /// <summary>
+    /// Opens a stable read view of everything successfully written so far.
+    ///
+    /// A write fault closes the writer but does not destroy the file, and the records that landed
+    /// before it are still perfectly good. Reporting nothing in that case throws away a whole
+    /// session's history to punish its last few seconds, so a faulted store still exports its
+    /// retained prefix — bounded by <see cref="_bytesWritten"/> (which only counts complete
+    /// records) and by the file's real length, since a failed flush can leave less on disk than
+    /// was handed to the writer.
+    /// </summary>
     public SessionHistoryReadSnapshot Capture()
     {
-        if (_stream is null || _writer is null)
-            return new SessionHistoryReadSnapshot(null, 0, _sensorIds.ToArray());
-
         try
         {
-            _writer.Flush();
-            _stream.Flush(flushToDisk: false);
-            long length = _stream.Position;
+            long length;
+            if (_stream is not null && _writer is not null)
+            {
+                _writer.Flush();
+                _stream.Flush(flushToDisk: false);
+                length = _stream.Position;
+            }
+            else
+            {
+                // Faulted or closed: fall back to the aligned prefix that reached the disk.
+                if (!File.Exists(_path))
+                    return new SessionHistoryReadSnapshot(null, 0, _sensorIds.ToArray());
+                length = Math.Min(_bytesWritten, new FileInfo(_path).Length);
+                length -= length % RecordSize;   // never hand out a torn record
+            }
+            if (length <= 0 && _stream is null)
+                return new SessionHistoryReadSnapshot(null, 0, _sensorIds.ToArray());
+
             var reader = new FileStream(
                 _path, FileMode.Open, FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete, 64 * 1024,

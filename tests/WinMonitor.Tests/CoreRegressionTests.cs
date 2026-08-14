@@ -30,6 +30,12 @@ var tests = new (string Name, Action Run)[]
     (nameof(NativeCallGateTests), NativeCallGateTests),
     (nameof(EcMutexFailClosedTests), EcMutexFailClosedTests),
     (nameof(IconHandleOwnershipTests), IconHandleOwnershipTests),
+    (nameof(ConfigBackupFailureTests), ConfigBackupFailureTests),
+    (nameof(MigrationChainTests), MigrationChainTests),
+    (nameof(CsvLayoutIdentityTests), CsvLayoutIdentityTests),
+    (nameof(CsvTornFileTests), CsvTornFileTests),
+    (nameof(SessionSpoolFaultTests), SessionSpoolFaultTests),
+    (nameof(CsvExportAtomicityTests), CsvExportAtomicityTests),
 };
 
 int failures = 0;
@@ -583,6 +589,316 @@ static void IconHandleOwnershipTests()
         "A NotifyIcon that throws on dispose must not skip the HICON release that follows it.");
 }
 
+/// <summary>
+/// A config that could not be read AND could not be moved aside is still on disk. Saving defaults
+/// over it would destroy the file we failed to read — which, for a locked or briefly denied file,
+/// is a config the user still wants.
+/// </summary>
+static void ConfigBackupFailureTests()
+{
+    // Backup reports failure rather than swallowing it.
+    MethodInfo? backup = typeof(ConfigStore).GetMethod(
+        "TryBackupCorrupt", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(backup is not null, "The corrupt-config backup helper should exist.");
+    Check.True(backup!.ReturnType == typeof(bool), "Backup must report whether it succeeded.");
+
+    string missing = Path.Combine(Path.GetTempPath(), "WinMonitor-absent-" + Guid.NewGuid().ToString("N"));
+    Check.True((bool)backup.Invoke(null, new object[] { missing })!,
+        "A file that is already gone needs no protection.");
+
+    // The whole chain: unreadable content, an unmovable file, then a save.
+    using (var scope = new ScopedConfigDirectory())
+    {
+        string path = Path.Combine(scope.Path, "config.json");
+        const string corrupt = "{ this is not json";
+        File.WriteAllText(path, corrupt);
+
+        // Shared for reading but not for delete: Load can read it, File.Move cannot move it.
+        using (new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            AppConfig loaded = ConfigStore.Load();
+            Check.True(loaded is not null, "A corrupt config should still yield defaults.");
+            Check.True(!File.Exists(path + ".bak"), "The backup was expected to fail in this test.");
+        }
+
+        ConfigStore.Save(new AppConfig());
+        Check.Equal(corrupt, File.ReadAllText(path),
+            "A config that could not be backed up must not be overwritten by a later save.");
+        Check.True(File.Exists(path + ".recovered"),
+            "The save should divert to the recovery sibling instead.");
+    }
+
+    // Control: when the backup succeeds, saving to config.json is correct — the original is safe
+    // under .bak and refusing to write would leave the user with no config at all.
+    using (var scope = new ScopedConfigDirectory())
+    {
+        string path = Path.Combine(scope.Path, "config.json");
+        File.WriteAllText(path, "{ this is not json");
+        ConfigStore.Load();
+        Check.True(File.Exists(path + ".bak"), "A movable corrupt config should be backed up.");
+        ConfigStore.Save(new AppConfig());
+        Check.True(!File.Exists(path + ".recovered"),
+            "A successful backup should not divert the save.");
+        Check.True(File.ReadAllText(path).Contains("SchemaVersion", StringComparison.Ordinal),
+            "The save should write a real config once the original is preserved.");
+    }
+}
+
+/// <summary>
+/// Every on-disk config walks the migration chain from wherever it was written. Real users' files
+/// start at v1, v2 or v3; a file from a newer build must be read best-effort and never overwritten.
+/// </summary>
+static void MigrationChainTests()
+{
+    // v3 -> v4 turns tray units on, so ShowUnit is the observable that proves each step ran.
+    string ConfigAtVersion(int version) =>
+        "{\"SchemaVersion\":" + version + ",\"Profiles\":[{\"Name\":\"Default\",\"TrayIcons\":"
+        + "[{\"SensorIds\":[\"/cpu/0/temperature/0\"],\"ShowUnit\":false}]}]}";
+
+    foreach (int start in new[] { 1, 2, 3 })
+    {
+        using var scope = new ScopedConfigDirectory();
+        File.WriteAllText(Path.Combine(scope.Path, "config.json"), ConfigAtVersion(start));
+        AppConfig config = ConfigStore.Load();
+        Check.Equal(4, config.SchemaVersion, $"A v{start} config should migrate to the current schema.");
+        Check.True(config.Profiles[0].TrayIcons[0].ShowUnit,
+            $"The v3 to v4 step must run for a config that started at v{start}.");
+        Check.True(!ConfigStore.IsLoadedFromNewerSchema, $"A v{start} config is not from a newer build.");
+    }
+
+    // A readable future schema: usable this session, but its unknown fields must survive.
+    using (var scope = new ScopedConfigDirectory())
+    {
+        string path = Path.Combine(scope.Path, "config.json");
+        const string future = "{\"SchemaVersion\":99,\"PollIntervalMs\":2000,\"SomethingNew\":42}";
+        File.WriteAllText(path, future);
+        ConfigStore.Load();
+        Check.True(ConfigStore.IsLoadedFromNewerSchema, "A v99 config should be recognised as newer.");
+        ConfigStore.Save(new AppConfig());
+        Check.Equal(future, File.ReadAllText(path), "A newer-schema config must never be overwritten.");
+        Check.True(File.Exists(path + ".newer-version"), "Saves should divert to the newer-version sibling.");
+    }
+
+    // A future schema this build cannot even parse: it is not evidence of corruption, so the
+    // source stays untouched and saves divert rather than backing it up as broken.
+    using (var scope = new ScopedConfigDirectory())
+    {
+        string path = Path.Combine(scope.Path, "config.json");
+        const string unparseable = "{\"SchemaVersion\":99,\"Profiles\":\"now a string\"}";
+        File.WriteAllText(path, unparseable);
+        ConfigStore.Load();
+        ConfigStore.Save(new AppConfig());
+        Check.Equal(unparseable, File.ReadAllText(path),
+            "An unparseable newer-schema config must be preserved verbatim.");
+        Check.True(!File.Exists(path + ".bak"), "A newer-schema file must not be treated as corrupt.");
+    }
+}
+
+/// <summary>
+/// The layout fingerprint decides whether today's CSV keeps its columns. It must cover everything
+/// that changes what a column MEANS, not merely what it is called.
+/// </summary>
+static void CsvLayoutIdentityTests()
+{
+    MethodInfo? fingerprint = typeof(HistoryLogger).GetMethod(
+        "BuildLayoutFingerprint", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(fingerprint is not null, "The layout fingerprint builder should exist.");
+
+    string Fingerprint(SensorDescriptor d) =>
+        (string)fingerprint!.Invoke(null, new object[] { new[] { d } })!;
+
+    // An EC sensor id is "/ec/reg/XX/{Kind}" and carries no quantity, so switching one from Fan to
+    // Temperature in the EC Explorer leaves id, name and header text identical.
+    var asFan = new SensorDescriptor
+    {
+        Id = "/ec/reg/B0/RawByte", HardwareName = "Embedded Controller", Name = "EC B0",
+        DisplayName = "EC B0", Category = SensorCategory.Fan, Quantity = SensorQuantity.Fan,
+    };
+    var asTemperature = new SensorDescriptor
+    {
+        Id = asFan.Id, HardwareName = asFan.HardwareName, Name = asFan.Name,
+        DisplayName = asFan.DisplayName, Category = SensorCategory.Motherboard,
+        Quantity = SensorQuantity.Temperature,
+    };
+    Check.True(Fingerprint(asFan) != Fingerprint(asTemperature),
+        "Changing a column from RPM to Celsius must roll to a new file, not reuse the column.");
+
+    var movedHardware = new SensorDescriptor
+    {
+        Id = asFan.Id, HardwareName = "Other controller", Name = asFan.Name,
+        DisplayName = asFan.DisplayName, Category = asFan.Category, Quantity = asFan.Quantity,
+    };
+    Check.True(Fingerprint(asFan) != Fingerprint(movedHardware),
+        "The owning hardware is part of a column's identity.");
+
+    // ...and an identical descriptor still matches, or every restart would start a new file.
+    var same = new SensorDescriptor
+    {
+        Id = asFan.Id, HardwareName = asFan.HardwareName, Name = asFan.Name,
+        DisplayName = asFan.DisplayName, Category = asFan.Category, Quantity = asFan.Quantity,
+    };
+    Check.Equal(Fingerprint(asFan), Fingerprint(same), "An unchanged layout must keep its file.");
+}
+
+/// <summary>
+/// A crash can leave the day's CSV ending mid-row. Appending there glues the next complete row onto
+/// the fragment and loses both.
+/// </summary>
+static void CsvTornFileTests()
+{
+    string directory = Path.Combine(Path.GetTempPath(), "WinMonitor-torn-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    var descriptor = Descriptor("/test/torn", "Torn");
+    var descriptors = new[] { descriptor };
+    var config = new AppConfig
+    {
+        Logging = new LoggingConfig { Enabled = true, IntervalSeconds = 5, RetentionDays = 0 },
+    };
+
+    try
+    {
+        // Produce a genuine file plus sidecar, then tear the last row off mid-write.
+        string first;
+        using (var logger = new HistoryLogger(config, () => descriptors, directory))
+        {
+            logger.Accept(new[] { Sample(descriptor.Id, 40f, DateTime.UtcNow) }, complete: true);
+            first = Directory.GetFiles(directory, "winmonitor-*.csv")[0];
+        }
+        File.AppendAllText(first, "2026-08-14T10:00:00,4");   // no newline: a torn row
+        string tornContent = File.ReadAllText(first);
+
+        using (var logger = new HistoryLogger(config, () => descriptors, directory))
+        {
+            logger.Accept(new[] { Sample(descriptor.Id, 41f, DateTime.UtcNow) }, complete: true);
+        }
+
+        Check.Equal(tornContent, File.ReadAllText(first),
+            "A torn CSV must be left exactly as it is, not appended to or repaired.");
+        string[] files = Directory.GetFiles(directory, "winmonitor-*.csv");
+        Check.Equal(2, files.Length, "Logging should continue in the next suffixed file.");
+        string continuation = files.First(f => !string.Equals(f, first, StringComparison.Ordinal));
+        Check.Equal(2, File.ReadAllLines(continuation).Length,
+            "The continuation file should hold its own header plus the new row.");
+    }
+    finally
+    {
+        try { Directory.Delete(directory, recursive: true); } catch { }
+    }
+}
+
+/// <summary>
+/// A spool write failure must cost only the records after it. Reporting nothing throws away a whole
+/// session to punish its last few seconds.
+/// </summary>
+static void SessionSpoolFaultTests()
+{
+    string path = Path.Combine(Path.GetTempPath(), "WinMonitor-spool-" + Guid.NewGuid().ToString("N") + ".csv");
+    var descriptor = Descriptor("/test/spool", "Spooled");
+    var descriptors = new[] { descriptor };
+    DateTime t0 = new(2026, 8, 14, 9, 0, 0, DateTimeKind.Utc);
+
+    using var tracker = new StatsTracker(historyCapacity: 4);
+    tracker.Accept(new[] { Sample(descriptor.Id, 10f, t0) });
+    tracker.Accept(new[] { Sample(descriptor.Id, 11f, t0.AddSeconds(1)) });
+
+    // Same timestamp twice: the exporter groups by tick and the last value wins. Making that
+    // explicit keeps the spool's implicit one-row-per-tick contract from drifting.
+    tracker.Accept(new[] { Sample(descriptor.Id, 12f, t0.AddSeconds(2)) });
+    tracker.Accept(new[] { Sample(descriptor.Id, 99f, t0.AddSeconds(2)) });
+
+    // Simulate exactly what Append's catch does on a write failure.
+    object spool = PrivateField(tracker, "_sessionHistory")!;
+    spool.GetType().GetMethod("CloseWriter", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .Invoke(spool, null);
+    spool.GetType().GetField("_faulted", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .SetValue(spool, true);
+
+    tracker.Accept(new[] { Sample(descriptor.Id, 50f, t0.AddSeconds(3)) });   // dropped
+
+    try
+    {
+        tracker.ExportTimeSeriesCsv(path, descriptors);
+        string[] lines = File.ReadAllLines(path);
+        Check.Equal(4, lines.Length,
+            "A faulted spool must still export the records written before the failure.");
+        Check.True(lines[1].Contains("10", StringComparison.Ordinal), "The first retained row should survive.");
+        Check.True(lines[3].Contains("99", StringComparison.Ordinal),
+            "Records sharing a timestamp collapse to one row, last value wins.");
+        Check.True(!lines[3].Contains("12", StringComparison.Ordinal),
+            "The superseded value for that timestamp must not appear.");
+
+        // With the spool itself gone there is nothing trustworthy to export, and a header-only
+        // file would be indistinguishable from an empty session.
+        string spoolPath = (string)PrivateField(spool, "_path")!;
+        File.Delete(spoolPath);
+        bool threw = false;
+        try { tracker.ExportTimeSeriesCsv(path, descriptors); }
+        catch (IOException) { threw = true; }
+        Check.True(threw, "An unreadable history must fail the export rather than write a header.");
+    }
+    finally
+    {
+        try { File.Delete(path); } catch { }
+    }
+}
+
+/// <summary>
+/// Export opened the destination with append:false, truncating the user's previous file the instant
+/// the dialog was confirmed — so a failure part-way through left them with neither file.
+/// </summary>
+static void CsvExportAtomicityTests()
+{
+    string directory = Path.Combine(Path.GetTempPath(), "WinMonitor-export-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    string path = Path.Combine(directory, "export.csv");
+    var descriptor = Descriptor("/test/export", "Exported");
+    var descriptors = new[] { descriptor };
+
+    try
+    {
+        const string sentinel = "PREVIOUS EXPORT";
+        File.WriteAllText(path, sentinel);
+
+        using (var tracker = new StatsTracker(historyCapacity: 2))
+        {
+            // Destroy the spool so the export must fail after the destination already exists.
+            object spool = PrivateField(tracker, "_sessionHistory")!;
+            spool.GetType().GetMethod("CloseWriter", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(spool, null);
+            File.Delete((string)PrivateField(spool, "_path")!);
+
+            bool threw = false;
+            try { tracker.ExportTimeSeriesCsv(path, descriptors); }
+            catch (IOException) { threw = true; }
+            Check.True(threw, "A failed export should report the failure.");
+            Check.Equal(sentinel, File.ReadAllText(path),
+                "A failed export must leave the previous file untouched.");
+        }
+        Check.Equal(0, Directory.GetFiles(directory, "*.tmp-*").Length,
+            "A failed export must not leave a temporary file behind.");
+
+        using (var tracker = new StatsTracker(historyCapacity: 2))
+        {
+            tracker.Accept(new[] { Sample(descriptor.Id, 7f, DateTime.UtcNow) });
+            tracker.ExportTimeSeriesCsv(path, descriptors);
+        }
+        Check.True(File.ReadAllText(path) != sentinel, "A successful export should replace the file.");
+        Check.Equal(0, Directory.GetFiles(directory, "*.tmp-*").Length,
+            "A successful export must not leave a temporary file behind.");
+    }
+    finally
+    {
+        try { Directory.Delete(directory, recursive: true); } catch { }
+    }
+}
+
+static object? PrivateField(object instance, string name)
+{
+    FieldInfo? field = instance.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+    Check.True(field is not null, $"Field {name} should exist on {instance.GetType().Name}.");
+    return field!.GetValue(instance);
+}
+
 /// <summary>Reads a repository source file relative to the solution root.</summary>
 static string ReadRepositoryFile(string relativePath)
 {
@@ -974,6 +1290,50 @@ static SensorDescriptor Descriptor(string id, string name) => new()
     Category = SensorCategory.Storage,
     Quantity = SensorQuantity.Temperature,
 };
+
+/// <summary>
+/// Points ConfigStore at a scratch directory for one test. The real config lives in %AppData% and
+/// belongs to the person running the harness; no check may read or write it.
+/// </summary>
+sealed class ScopedConfigDirectory : IDisposable
+{
+    private static readonly FieldInfo Backing = ResolveBackingField();
+    private readonly string _previous;
+
+    public string Path { get; }
+
+    public ScopedConfigDirectory()
+    {
+        _previous = ConfigStore.ConfigDirectory;
+        Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            "WinMonitor-cfgtest-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path);
+        Backing.SetValue(null, Path);
+    }
+
+    public void Dispose()
+    {
+        Backing.SetValue(null, _previous);
+        // The directory was just written to, so a scanner or indexer can still hold it briefly;
+        // one retry keeps the harness from littering %TEMP% with empty folders.
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try { Directory.Delete(Path, recursive: true); return; }
+            catch { Thread.Sleep(50); }
+        }
+    }
+
+    private static FieldInfo ResolveBackingField()
+    {
+        FieldInfo? field = typeof(ConfigStore).GetField(
+            "<ConfigDirectory>k__BackingField", BindingFlags.Static | BindingFlags.NonPublic);
+        // Fail loudly: silently falling back would run these checks against the real config.
+        if (field is null)
+            throw new InvalidOperationException("ConfigStore.ConfigDirectory backing field not found; " +
+                "redirection is required so the harness never touches the real config.");
+        return field;
+    }
+}
 
 /// <summary>
 /// Stands in for the app's SyncWindow: the harness has no message loop, so marshaled work runs
