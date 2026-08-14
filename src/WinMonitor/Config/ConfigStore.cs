@@ -32,7 +32,13 @@ public static class ConfigStore
     // understands, but it must never overwrite the newer document and discard future fields.
     private static bool _loadedNewerSchema;
 
-    public static string ConfigDirectory { get; }
+    /// <summary>
+    /// Where config.json lives. Fixed at startup by the static constructor; the setter is private
+    /// purely so the regression harness can redirect persistence at a scratch directory, because
+    /// the alternative is checks that read and rewrite the maintainer's real configuration.
+    /// Nothing in the application may move it.
+    /// </summary>
+    public static string ConfigDirectory { get; private set; }
     public static bool IsPortable { get; }
     public static bool IsLoadedFromNewerSchema => _loadedNewerSchema;
 
@@ -156,9 +162,17 @@ public static class ConfigStore
         catch (Exception ex)
         {
             // Corrupt or unreadable: keep the evidence, start from defaults.
-            TryBackupCorrupt(path);
+            //
+            // Whether the evidence was actually moved aside decides where a later Save may write.
+            // If the backup failed the original file is still sitting there, and saving defaults
+            // over it would destroy the very config we could not read — which, for a file that was
+            // only locked or briefly denied, is a config the user still wants. Divert instead.
+            bool backedUp = TryBackupCorrupt(path);
+            if (!backedUp) _loadFailed = true;
             config = new AppConfig();
-            Diag.Log("config", "Config corrupt; backed up to config.json.bak and reset to defaults", ex);
+            Diag.Log("config", backedUp
+                ? "Config corrupt; backed up to config.json.bak and reset to defaults"
+                : "Config corrupt and could not be backed up; running on defaults and diverting saves", ex);
         }
 
         // A recovery sibling always uses this build's schema; the newer source file remains
@@ -260,16 +274,23 @@ public static class ConfigStore
             File.Move(tmp, path);
     }
 
-    private static void TryBackupCorrupt(string path)
+    /// <summary>
+    /// Moves an unreadable config aside. Returns true when the original is no longer at
+    /// <paramref name="path"/> — the only condition under which writing a fresh config there
+    /// destroys nothing. A missing file counts as success: there is nothing left to protect.
+    /// </summary>
+    private static bool TryBackupCorrupt(string path)
     {
         try
         {
-            if (!File.Exists(path)) return;
+            if (!File.Exists(path)) return true;
             File.Move(path, path + ".bak", overwrite: true);
+            return true;
         }
         catch
         {
-            // Backup is best-effort; defaults are returned regardless.
+            // Backup is best-effort; the caller diverts saves so the original survives.
+            return false;
         }
     }
 

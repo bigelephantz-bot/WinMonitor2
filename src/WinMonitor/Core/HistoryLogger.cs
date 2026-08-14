@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using WinMonitor.Config;
+using WinMonitor.Localization;
 
 namespace WinMonitor.Core;
 
@@ -196,6 +197,34 @@ public sealed class HistoryLogger : IDisposable
     internal static string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
         SessionHistoryReadSnapshot snapshot)
     {
+        // An unreadable spool must not look like an empty session: both produce a header and no
+        // rows, and only one of them is a correct answer.
+        if (!snapshot.IsReadable)
+            throw new IOException(Loc.T("export.history_unavailable"));
+
+        // Write beside the destination and swap. Truncating the target first — as `append: false`
+        // does — destroys the user's previous export the moment the dialog is confirmed, so a
+        // failure part-way through a long session leaves them with neither file.
+        string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            WriteTimeSeriesCsv(temp, descriptors, snapshot);
+            if (File.Exists(path))
+                File.Replace(temp, path, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            else
+                File.Move(temp, path);
+            return path;
+        }
+        catch
+        {
+            TryDelete(temp);
+            throw;
+        }
+    }
+
+    private static void WriteTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
+        SessionHistoryReadSnapshot snapshot)
+    {
         var descriptorIndexById = new Dictionary<string, int>(descriptors.Count, StringComparer.Ordinal);
         for (int i = 0; i < descriptors.Count; i++)
             descriptorIndexById[descriptors[i].Id] = i;
@@ -243,7 +272,6 @@ public sealed class HistoryLogger : IDisposable
             WriteSessionRow(writer, sb, currentTicks, descriptors, values, present);
 
         writer.Flush();
-        return path;
     }
 
     private static void WriteSessionRow(StreamWriter writer, StringBuilder sb, long timestamp,
@@ -318,6 +346,16 @@ public sealed class HistoryLogger : IDisposable
                 {
                     continue; // column layout differs — try the next suffix
                 }
+                else if (!EndsAtLineBoundary(path))
+                {
+                    // The previous run died mid-row (a crash, or a write that failed after a
+                    // partial flush). Appending here would glue the next complete row onto that
+                    // fragment and lose both. Leave the file exactly as it is — a torn last row
+                    // is still readable evidence — and start the next suffix.
+                    Diag.Log("logging", "CSV " + Path.GetFileName(path)
+                        + " ends mid-row; continuing in the next file rather than appending");
+                    continue;
+                }
             }
             else if (File.Exists(layoutPath)
                 && !string.Equals(ReadLayoutFingerprint(layoutPath), layoutFingerprint, StringComparison.Ordinal))
@@ -363,13 +401,19 @@ public sealed class HistoryLogger : IDisposable
     /// </summary>
     private static string BuildLayoutFingerprint(IReadOnlyList<SensorDescriptor> descriptors)
     {
-        var sb = new StringBuilder(descriptors.Count * 48);
+        var sb = new StringBuilder(descriptors.Count * 64);
         for (int i = 0; i < descriptors.Count; i++)
         {
             SensorDescriptor d = descriptors[i];
             AppendFingerprintField(sb, d.Id);
+            AppendFingerprintField(sb, d.HardwareName);
             AppendFingerprintField(sb, d.Name);
             AppendFingerprintField(sb, DisplayNameOf(d));
+            // Quantity is what the numbers in the column MEAN, and it is not implied by the id.
+            // An EC sensor id is "/ec/reg/XX/{Kind}", so switching one from Fan to Temperature in
+            // the EC Explorer keeps the id, the name and the header text identical while the
+            // column silently changes from RPM to °C. Identity has to include the unit.
+            AppendFingerprintField(sb, d.Quantity.ToString());
         }
         return sb.ToString();
     }
@@ -402,6 +446,28 @@ public sealed class HistoryLogger : IDisposable
             sb.Append(c);
         }
         sb.Append('"');
+    }
+
+    /// <summary>
+    /// True when the file is empty or its last byte ends a line. Only a byte check is safe here:
+    /// the file is UTF-8 with a BOM and may end mid-multi-byte-character, which a text reader
+    /// would silently paper over.
+    /// </summary>
+    private static bool EndsAtLineBoundary(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            if (stream.Length == 0) return true;
+            stream.Position = stream.Length - 1;
+            return stream.ReadByte() == '\n';
+        }
+        catch
+        {
+            // Unreadable: treat it as unsafe to append to rather than assuming it is intact.
+            return false;
+        }
     }
 
     private static string? ReadFirstLine(string path)
