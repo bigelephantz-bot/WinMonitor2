@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using WinMonitor.Config;
@@ -22,6 +23,7 @@ public sealed partial class SettingsForm : Form
     private bool _loading;    // suppress event handlers while (re)populating controls
     private bool _applying;   // this form's own ctx.ApplySettings() call is in flight
     private readonly ToolTip _optionToolTip;
+    private System.Drawing.Icon? _windowIcon;   // owned: ExtractAssociatedIcon result, freed in Dispose
     private string _lastLocalization;
     private bool _lastDarkTheme;
 
@@ -55,7 +57,9 @@ public sealed partial class SettingsForm : Form
         BackColor = Theme.WindowBack;
         Size = new Size(720, 560);
         MinimumSize = new Size(700, 520);
-        try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        // ExtractAssociatedIcon hands ownership to the caller, so the icon is retained and disposed
+        // with the form. Form.Dispose does not release an Icon it was merely assigned.
+        try { Icon = _windowIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
         _tabs = new TabControl { Dock = DockStyle.Fill };
         _tabs.SelectedIndexChanged += OnTabChanged;
@@ -168,6 +172,22 @@ public sealed partial class SettingsForm : Form
         base.OnFormClosed(e);
     }
 
+    /// <summary>
+    /// Releases the window icon here rather than in OnFormClosed: a form can be disposed without
+    /// ever being shown or closed, and the icon handle is ours either way.
+    /// </summary>
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            // Detach before disposing so the form never repaints from a freed handle.
+            Icon = null;
+            _windowIcon?.Dispose();
+            _windowIcon = null;
+        }
+        base.Dispose(disposing);
+    }
+
     private static string SerializeConfig(AppConfig config)
         => JsonSerializer.Serialize(config);
 
@@ -242,9 +262,86 @@ public sealed partial class SettingsForm : Form
             return MergeProfiles(baselineProfiles, draftProfiles, liveProfiles);
         }
 
+        if (propertyName == nameof(Profile.TrayIcons)
+            && baseline is JsonArray baselineIcons
+            && draft is JsonArray draftIcons
+            && live is JsonArray liveIcons)
+        {
+            return MergeTrayIcons(baselineIcons, draftIcons, liveIcons);
+        }
+
         // A collection with two concurrent edits has no general item identity. Prefer the draft:
         // applying a list edit must keep its selected order and explicit removals deterministic.
         return draft?.DeepClone();
+    }
+
+    /// <summary>
+    /// Tray icons need their own rule because they are the one collection edited from two places at
+    /// once: this dialog, and the main window's row context menu (which adds or removes a
+    /// single-sensor icon on the live config without raising SettingsApplied). Preferring the draft
+    /// wholesale means an icon toggled on in the main list vanishes the moment Apply is pressed.
+    ///
+    /// Identity is the ordered sensor-id set. <see cref="TrayIconConfig"/> carries no persistent id,
+    /// and introducing one would mean a config schema bump for a merge edge case; the sensor set
+    /// distinguishes every icon that can currently be created outside this dialog. If any of the
+    /// three lists contains duplicate keys the set is genuinely ambiguous, so the draft wins as before.
+    /// </summary>
+    private static JsonArray MergeTrayIcons(JsonArray baseline, JsonArray draft, JsonArray live)
+    {
+        static string Key(JsonNode? node)
+        {
+            if (node is not JsonObject icon || icon["SensorIds"] is not JsonArray ids) return "";
+            // Length-prefixed so an id containing the separator cannot forge another key.
+            var sb = new StringBuilder();
+            foreach (JsonNode? id in ids)
+            {
+                string value = id?.GetValue<string>() ?? "";
+                sb.Append(value.Length).Append(':').Append(value).Append('|');
+            }
+            return sb.ToString();
+        }
+
+        static Dictionary<string, JsonObject>? IndexByKey(JsonArray array)
+        {
+            var result = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+            foreach (JsonNode? node in array)
+            {
+                if (node is not JsonObject icon) continue;
+                // Duplicates make the key useless as identity; fall back to the old behavior.
+                if (!result.TryAdd(Key(icon), icon)) return null;
+            }
+            return result;
+        }
+
+        Dictionary<string, JsonObject>? baselineByKey = IndexByKey(baseline);
+        Dictionary<string, JsonObject>? draftByKey = IndexByKey(draft);
+        Dictionary<string, JsonObject>? liveByKey = IndexByKey(live);
+        if (baselineByKey is null || draftByKey is null || liveByKey is null) return (JsonArray)draft.DeepClone();
+
+        var merged = new JsonArray();
+        foreach (JsonNode? node in draft)
+        {
+            if (node is not JsonObject draftIcon) continue;
+            string key = Key(draftIcon);
+            baselineByKey.TryGetValue(key, out JsonObject? baselineIcon);
+            bool liveHasIt = liveByKey.TryGetValue(key, out JsonObject? liveIcon);
+
+            // Removed live and untouched here (a row toggled off, or an obsolete sensor pruned):
+            // that removal is the newer intent, so honour it instead of resurrecting the icon.
+            if (baselineIcon is not null && !liveHasIt && JsonNode.DeepEquals(draftIcon, baselineIcon))
+                continue;
+
+            merged.Add(MergeDraftNode(baselineIcon, draftIcon, liveIcon ?? draftIcon,
+                nameof(Profile.TrayIcons) + ".item") ?? draftIcon.DeepClone());
+        }
+        foreach (JsonNode? node in live)
+        {
+            if (node is not JsonObject liveIcon) continue;
+            string key = Key(liveIcon);
+            if (draftByKey.ContainsKey(key) || baselineByKey.ContainsKey(key)) continue;
+            merged.Add(liveIcon.DeepClone());   // added outside this dialog while it was open
+        }
+        return merged;
     }
 
     private static JsonArray MergeProfiles(JsonArray baseline, JsonArray draft, JsonArray live)

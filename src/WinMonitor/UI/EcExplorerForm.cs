@@ -36,6 +36,7 @@ public sealed class EcExplorerForm : Form
     private readonly ListBox _sensorList;
     private readonly Button _addButton, _removeButton, _resetButton, _closeButton;
     private readonly System.Windows.Forms.Timer _timer;
+    private System.Drawing.Icon? _windowIcon;   // owned: ExtractAssociatedIcon result, freed in Dispose
 
     // --- fan-finder tool controls ---
     private readonly ListBox _candidateList;
@@ -83,7 +84,9 @@ public sealed class EcExplorerForm : Form
         StartPosition = FormStartPosition.CenterParent;
         MinimumSize = new Size(860, 560);
         Size = new Size(920, 600);
-        try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        // Owned by this form: ExtractAssociatedIcon transfers ownership and Form.Dispose does not
+        // release an Icon it was merely assigned.
+        try { Icon = _windowIcon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
         BackColor = Theme.WindowBack;
 
         for (int i = 0; i < 256; i++) { _min[i] = int.MaxValue; _max[i] = int.MinValue; _snapA[i] = -1; _snapB[i] = -1; }
@@ -663,6 +666,21 @@ public sealed class EcExplorerForm : Form
         _timer.Dispose();
         _detail.Font.Dispose();
         base.OnFormClosed(e);
+    }
+
+    /// <summary>
+    /// Releases the window icon here rather than in OnFormClosed: a form can be disposed without
+    /// ever being shown or closed, and the icon handle is ours either way.
+    /// </summary>
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            Icon = null;
+            _windowIcon?.Dispose();
+            _windowIcon = null;
+        }
+        base.Dispose(disposing);
     }
 
     // ---------- owner-drawn 16x16 register grid ----------
