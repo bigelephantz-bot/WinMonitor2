@@ -240,10 +240,14 @@ public sealed partial class SettingsForm
     {
         try
         {
+            // Edits go into this dialog's draft, not the live config: the explorer adds and removes
+            // sensors, and Cancel here has to be able to undo that like any other setting. The
+            // hardware accessor stays live — reading registers is how the explorer finds them —
+            // but the resulting definitions only reach the poll thread when Apply publishes them.
             using var form = new EcExplorerForm(
                 _ctx.Sensors.Ec,
-                _ctx.Config.Ec,
-                () => _ctx.Sensors.RefreshEcSensors(_ctx.Config.Ec),
+                Config.Ec,
+                OnDraftEcSensorsChanged,
                 () => (_ctx.Stats.GetLatestValue(SensorPicker.PickAuto(_ctx.Sensors.Descriptors) ?? "") ?? float.NaN,
                        float.NaN));
             form.ShowDialog(this);
@@ -253,5 +257,15 @@ public sealed partial class SettingsForm
             Diag.Log("ec", "EC explorer failed to open", ex);
             MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    }
+
+    /// <summary>
+    /// The explorer changed the draft's EC sensor list. Nothing is published here — the Sensors tab
+    /// is reloaded so the new definitions are visible, and Apply is what reaches the poll thread.
+    /// </summary>
+    private void OnDraftEcSensorsChanged()
+    {
+        Config.Ec.Enabled = Config.Ec.Enabled || Config.Ec.Sensors.Count > 0;
+        if (!IsDisposed && !Disposing) LoadAllTabs();
     }
 }

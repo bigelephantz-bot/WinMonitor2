@@ -14,8 +14,9 @@ namespace WinMonitor.Tray;
 /// The canvas matches the shell's actual small-icon size at the current system DPI
 /// (SM_CXSMICON/SM_CYSMICON — 16x16 at 100% scaling, 24x24 at 150%), so the taskbar shows our
 /// pixels 1:1; rendering 32x32 and letting the shell resample down was one source of blur.
-/// The size is computed once and cached: taskbar DPI changes are rare and a stale size
-/// until restart is an accepted trade-off.
+/// The size is cached rather than queried per render, and <see cref="RefreshMetrics"/> drops it
+/// (with every font, brush, pen and path sized against it) when the display configuration changes,
+/// so a scale change no longer leaves the tray rendering at the startup DPI until restart.
 ///
 /// Legibility at 16 px is dominated by three choices, all settled by rendering the candidates
 /// and comparing pixels rather than by theory: glyphs below <see cref="AntiAliasMinPx"/> are
@@ -37,8 +38,19 @@ public static class IconRenderer
     // number's reduced band so the digits never bleed into the graph.
     private const float SparklineBandFraction = 0.30f;
 
-    /// <summary>Edge of the square canvas; see class remarks for the DPI fallback chain.</summary>
-    private static readonly int CanvasSize = ComputeCanvasSize();
+    /// <summary>
+    /// Edge of the square canvas; see class remarks for the DPI fallback chain. Cached rather than
+    /// queried per render (this runs per tray tick), and invalidated explicitly by
+    /// <see cref="RefreshMetrics"/> when the display configuration changes.
+    /// </summary>
+    private static int CanvasSize = ComputeCanvasSize();
+
+    /// <summary>
+    /// Test seam for the shell metric. Production leaves this null and uses the real DPI query;
+    /// the regression harness substitutes a size so invalidation can be exercised without a
+    /// second monitor.
+    /// </summary>
+    private static Func<int>? _canvasSizeProvider;
 
     // Semibold face keeps thin digit strokes from washing out at tray sizes. Field order
     // matters: _textFamily must be initialized before _baseStyle reads it.
@@ -241,6 +253,52 @@ public static class IconRenderer
     {
         if (handle == IntPtr.Zero) return;
         try { DestroyIcon(handle); } catch { /* teardown must not throw over a lost handle */ }
+    }
+
+    /// <summary>
+    /// Re-reads the shell small-icon size and, if it changed, drops every cached resource sized
+    /// against the old one. Returns true when the caller must re-render its icons.
+    ///
+    /// The size was previously fixed for the process lifetime, so changing the display scale left
+    /// the tray rendering at the old canvas until restart. Nothing about the legibility rules moves
+    /// here: after invalidation the next render is byte-identical to a fresh start at the new DPI,
+    /// which is the configuration those rules were tuned against.
+    /// </summary>
+    public static bool RefreshMetrics()
+    {
+        lock (_gate)
+        {
+            int updated = _canvasSizeProvider?.Invoke() ?? ComputeCanvasSize();
+            if (updated <= 0 || updated == CanvasSize) return false;
+
+            CanvasSize = updated;
+            // Fonts are fitted to the canvas and pens/brushes/paths are sized with it, so every
+            // cache keyed on the old size is now wrong rather than merely stale.
+            foreach (Font font in _fontCache.Values) font.Dispose();
+            _fontCache.Clear();
+            _fittedPxCache.Clear();
+            foreach (SolidBrush brush in _brushCache.Values) brush.Dispose();
+            _brushCache.Clear();
+            foreach (Pen pen in _penCache.Values) pen.Dispose();
+            _penCache.Clear();
+            _badgePath?.Dispose();
+            _badgePath = null;
+            _sparkPoints = System.Array.Empty<PointF>();
+            return true;
+        }
+    }
+
+    /// <summary>Regression-harness hook: substitutes the shell metric. Null restores the real query.</summary>
+    public static void SetCanvasSizeProviderForTests(Func<int>? provider)
+    {
+        lock (_gate) { _canvasSizeProvider = provider; }
+        RefreshMetrics();
+    }
+
+    /// <summary>Current canvas edge, exposed so a caller can assert what it will render at.</summary>
+    public static int CurrentCanvasSize
+    {
+        get { lock (_gate) { return CanvasSize; } }
     }
 
     /// <summary>

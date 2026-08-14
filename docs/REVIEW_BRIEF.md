@@ -54,8 +54,12 @@ Each of these looks like a defect and is not. Changing one is a regression.
    is the product, not an implementation detail.
 7. **No allocations or LINQ in per-tick or per-paint paths.** Reuse buffers, cache pens and fonts,
    compare before formatting.
-8. **`SettingsForm` mutates `ctx.Config` live** and restores a JSON snapshot on Cancel. The
-   Diagnostics tab deliberately reads the live service rather than the draft.
+8. **`SettingsForm` edits an isolated draft**, never the live config, so Cancel and X are no-ops by
+   construction. Apply/OK three-way merges only the draft's own changes into the current live
+   config (baseline / draft / live), which is what lets a tray action taken elsewhere survive an
+   Apply. Named profiles merge by name and tray icons by their sensor set; other arrays prefer the
+   draft. The Diagnostics tab deliberately reads the **live service**, not the draft, because
+   polling health must stay accurate while edits are pending.
 9. **A non-elevated run is degraded by design** — battery and CPU load only.
 10. **Temperatures are °C everywhere internally**; °F exists only at display time.
 11. **`SensorService` fires `SnapshotUpdated` on the poll thread.** Consumers marshal with a

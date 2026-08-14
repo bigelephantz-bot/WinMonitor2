@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using WinMonitor.Config;
 using WinMonitor.Core;
@@ -136,6 +137,7 @@ public sealed class WinMonitorContext : ApplicationContext
     private volatile bool _exiting;
     private bool _sessionEndingHooked;
     private bool _powerModeHooked;
+    private bool _displaySettingsHooked;
 
     // Auto peak reset (item 15): 1-minute schedule check + a guard so one target minute
     // never triggers twice. -1 = never auto-reset this session.
@@ -144,6 +146,15 @@ public sealed class WinMonitorContext : ApplicationContext
     // Handed to HistoryLogger so a due CSV row can pull one full hardware sweep instead of
     // recording whatever smart polling happened to sample. Cached: OnSnapshot runs per tick.
     private readonly Action _requestLoggingSweep;
+
+    // CSV export lifetime is tracked here, not on MainForm. Closing to the tray and a theme change
+    // both dispose that form while the export worker keeps running, and a disposed form cannot tell
+    // ExitApp that a write is still in flight.
+    private int _exportsInProgress;
+
+    // EC sensor definitions now travel with the settings draft, so an Apply has to publish them to
+    // the poll thread. Compared against the last applied set to avoid a descriptor rebuild per Apply.
+    private string _appliedEcSignature = "";
     private long _lastAutoPeakResetTick = -1;
 
     // Throttle-indicator enabled state at the last ApplySettings. When it flips, the descriptor
@@ -176,6 +187,9 @@ public sealed class WinMonitorContext : ApplicationContext
 
         Sensors = new SensorService(() => Config);
         _requestLoggingSweep = () => Sensors.RequestFullSweep();
+        // Start() below already snapshots this config's EC sensors; recording the signature here
+        // keeps the first Apply from forcing a redundant descriptor rebuild.
+        _appliedEcSignature = DescribeEcConfig(config.Ec);
         Stats = new StatsTracker();
         Alerts = new AlertEngine(() => Config);
         Logger = new HistoryLogger(() => Config, () => Sensors.Descriptors);
@@ -216,6 +230,14 @@ public sealed class WinMonitorContext : ApplicationContext
             _powerModeHooked = true;
         }
 
+        // A display-scale change alters the shell's small-icon size, which the tray renders at.
+        // Without this the icons stay at the startup DPI until the app restarts.
+        if (!_displaySettingsHooked)
+        {
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+            _displaySettingsHooked = true;
+        }
+
         ApplyEffectivePollInterval();
 
         // Global hotkey (toggle compact overlay). Failure (combo taken) is logged, never fatal.
@@ -237,6 +259,17 @@ public sealed class WinMonitorContext : ApplicationContext
             else ShowMainWindow();
         }
     }
+
+    /// <summary>
+    /// True while any CSV export worker is running. Owned by the context because every window that
+    /// can start an export can also be disposed while it runs (close-to-tray, theme recreation).
+    /// </summary>
+    public bool IsExportInProgress => Volatile.Read(ref _exportsInProgress) > 0;
+
+    /// <summary>Brackets an export so <see cref="ExitApp"/> can see it from anywhere.</summary>
+    internal void BeginExport() => Interlocked.Increment(ref _exportsInProgress);
+
+    internal void EndExport() => Interlocked.Decrement(ref _exportsInProgress);
 
     // ---------- data fan-out ----------
 
@@ -469,6 +502,24 @@ public sealed class WinMonitorContext : ApplicationContext
         });
     }
 
+    /// <summary>
+    /// Stable text form of the EC sensor set, used only to decide whether an Apply actually changed
+    /// it. Cheap enough for a settings apply and avoids a descriptor rebuild on every OK press.
+    /// </summary>
+    private static string DescribeEcConfig(EcConfig ec)
+    {
+        if (ec is null) return "off";
+        var sb = new StringBuilder(32 + ec.Sensors.Count * 24);
+        sb.Append(ec.Enabled ? '1' : '0');
+        foreach (EcSensorDef? sensor in ec.Sensors)
+        {
+            if (sensor is null) continue;
+            sb.Append('|').Append(sensor.SensorId).Append(':').Append(sensor.Quantity)
+              .Append(':').Append(sensor.Name).Append(':').Append(sensor.Divisor);
+        }
+        return sb.ToString();
+    }
+
     private void OnEcSensorsChanged()
     {
         // Runs on the UI thread, which owns Config.Ec.Sensors. RefreshEcSensors deep-copies the
@@ -690,6 +741,15 @@ public sealed class WinMonitorContext : ApplicationContext
             _lastThrottleEnabled = Config.ThrottleIndicatorEnabled;
             Sensors.RequestDescriptorRebuild();
         }
+        // EC sensor definitions are edited in the Settings draft (the EC Explorer opens from there),
+        // so publishing them to the poll thread is part of applying settings. RefreshEcSensors
+        // deep-copies on this thread, so the poll thread only ever sees an immutable snapshot.
+        string ecSignature = DescribeEcConfig(Config.Ec);
+        if (!string.Equals(ecSignature, _appliedEcSignature, StringComparison.Ordinal))
+        {
+            _appliedEcSignature = ecSignature;
+            Sensors.RefreshEcSensors(Config.Ec);
+        }
         QueueStartupRegistration(reportFailure: true);
         InvokeOnUi(() =>
         {
@@ -785,15 +845,38 @@ public sealed class WinMonitorContext : ApplicationContext
         Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
     }
 
+    /// <summary>
+    /// Display scale or layout changed: the shell's small-icon size may have moved, and every tray
+    /// icon is rendered at exactly that size. Re-render only when it actually changed.
+    /// </summary>
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        InvokeOnUi(() =>
+        {
+            if (!IconRenderer.RefreshMetrics()) return;
+            Diag.Log("tray", "Shell icon size changed; re-rendering tray icons");
+            Tray.Rebuild(Sensors.Descriptors);
+        });
+    }
+
+    private void UnhookDisplaySettings()
+    {
+        if (!_displaySettingsHooked) return;
+        _displaySettingsHooked = false;
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+    }
+
     public void ExitApp()
     {
         if (_exiting) return;
 
-        // A CSV export runs on a worker thread; ExitThread would kill it mid-write and leave a
-        // silently truncated file. Let the user finish or knowingly abandon it.
-        if (_mainForm is { IsDisposed: false } mf && mf.IsExportInProgress)
+        // A CSV export runs on a worker thread; ExitThread would kill it mid-write, abandoning the
+        // export and leaving its temporary file beside the user's chosen destination. The flag lives
+        // on the context, so this still fires after the window that started it was disposed.
+        if (IsExportInProgress)
         {
-            var answer = MessageBox.Show(mf, Loc.T("main.export_busy"), Loc.T("app.name"),
+            IWin32Window? owner = _mainForm is { IsDisposed: false } mf ? mf : null;
+            var answer = MessageBox.Show(owner, Loc.T("main.export_busy"), Loc.T("app.name"),
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
             if (answer != DialogResult.Yes) return;
             Diag.Log("app", "Exit requested while a CSV export was still running; file may be truncated");
@@ -806,6 +889,7 @@ public sealed class WinMonitorContext : ApplicationContext
         Diag.Log("app", "Shutting down");
         UnhookSessionEnding();
         UnhookPowerMode();
+        UnhookDisplaySettings();
         CleanupOwnedResources();
         ExitThread();
     }
@@ -858,6 +942,7 @@ public sealed class WinMonitorContext : ApplicationContext
             _exiting = true;
             UnhookSessionEnding();
             UnhookPowerMode();
+            UnhookDisplaySettings();
             CleanupOwnedResources();
         }
         base.Dispose(disposing);
