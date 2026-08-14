@@ -1041,11 +1041,8 @@ public sealed class MainForm : Form
     // Exports / About
     // =========================================================================
 
-    /// <summary>
-    /// True while a CSV export worker is running. Shutdown checks this: ExitThread would kill the
-    /// worker mid-write and leave a truncated file with no indication anything went wrong.
-    /// </summary>
-    public bool IsExportInProgress { get; private set; }
+    // Export progress is tracked by WinMonitorContext, not here: closing to the tray disposes this
+    // form while the worker keeps writing, and a disposed form cannot warn ExitApp about it.
 
     private async void ExportTimeSeriesCsv()
     {
@@ -1074,7 +1071,7 @@ public sealed class MainForm : Form
 
         _exportButton.Enabled = false;
         _exportCsvItem.Enabled = false;
-        IsExportInProgress = true;
+        _ctx.BeginExport();
         try
         {
             // Raw values keep CSV units stable even if the display uses Fahrenheit. Disk-backed
@@ -1096,7 +1093,7 @@ public sealed class MainForm : Form
         }
         finally
         {
-            IsExportInProgress = false;
+            _ctx.EndExport();
             if (!IsDisposed && !Disposing)
             {
                 _exportButton.Enabled = true;

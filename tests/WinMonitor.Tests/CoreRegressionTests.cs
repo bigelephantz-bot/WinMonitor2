@@ -7,6 +7,7 @@ using WinMonitor.Config;
 using WinMonitor.Core;
 using WinMonitor.Localization;
 using WinMonitor.Tray;
+using WinMonitor.UI;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -36,6 +37,9 @@ var tests = new (string Name, Action Run)[]
     (nameof(CsvTornFileTests), CsvTornFileTests),
     (nameof(SessionSpoolFaultTests), SessionSpoolFaultTests),
     (nameof(CsvExportAtomicityTests), CsvExportAtomicityTests),
+    (nameof(TrayIconMergeTests), TrayIconMergeTests),
+    (nameof(WindowIconOwnershipTests), WindowIconOwnershipTests),
+    (nameof(TrayCanvasDpiTests), TrayCanvasDpiTests),
 };
 
 int failures = 0;
@@ -890,6 +894,134 @@ static void CsvExportAtomicityTests()
     {
         try { Directory.Delete(directory, recursive: true); } catch { }
     }
+}
+
+/// <summary>
+/// Tray icons are the one collection edited from two places at once: the Settings dialog and the
+/// main window's row context menu, which adds or removes a single-sensor icon on the LIVE config.
+/// Preferring the draft wholesale made an icon toggled on in the main list vanish on Apply.
+/// </summary>
+static void TrayIconMergeTests()
+{
+    MethodInfo? merge = typeof(SettingsForm).GetMethod(
+        "MergeDraftNode", BindingFlags.Static | BindingFlags.NonPublic);
+    Check.True(merge is not null, "The settings three-way merge should exist.");
+
+    static JsonArray Icons(params string[] specs)
+    {
+        var array = new JsonArray();
+        foreach (string spec in specs)
+        {
+            string[] parts = spec.Split('@');
+            array.Add(new JsonObject
+            {
+                ["SensorIds"] = new JsonArray(JsonValue.Create(parts[0])),
+                ["RotateIntervalSec"] = int.Parse(parts.Length > 1 ? parts[1] : "5"),
+            });
+        }
+        return array;
+    }
+
+    JsonArray Merge(JsonArray baseline, JsonArray draft, JsonArray live)
+    {
+        object? result = merge!.Invoke(null, new object?[] { baseline, draft, live, "TrayIcons" });
+        Check.True(result is JsonArray, "Merging tray icon arrays should produce an array.");
+        return (JsonArray)result!;
+    }
+
+    static List<string> Sensors(JsonArray array)
+    {
+        var ids = new List<string>();
+        foreach (JsonNode? node in array)
+            ids.Add(node?["SensorIds"]?[0]?.GetValue<string>() ?? "");
+        return ids;
+    }
+
+    // The reported case: Settings edits icon A while the main window toggles B into the tray.
+    JsonArray merged = Merge(Icons("A"), Icons("A@9"), Icons("A", "B"));
+    Check.Sequence(new[] { "A", "B" }, Sensors(merged),
+        "An icon added outside the dialog must survive Apply.");
+    Check.Equal(9, merged[0]!["RotateIntervalSec"]!.GetValue<int>(),
+        "The draft's own edit to A must be kept.");
+
+    // The mirror case, reachable through the obsolete-sensor prune: an icon removed live while the
+    // draft did not touch it stays removed rather than being resurrected.
+    Check.Sequence(new[] { "A" }, Sensors(Merge(Icons("A", "B"), Icons("A@9", "B"), Icons("A"))),
+        "An icon removed outside the dialog must not come back.");
+
+    // A draft removal is explicit and must win over an untouched live copy.
+    Check.Sequence(new[] { "A" }, Sensors(Merge(Icons("A", "B"), Icons("A"), Icons("A", "B"))),
+        "An icon deleted in the dialog must stay deleted.");
+
+    // Draft ordering is intentional and must not be reshuffled by the merge.
+    Check.Sequence(new[] { "B", "A" }, Sensors(Merge(Icons("A", "B"), Icons("B", "A"), Icons("A", "B"))),
+        "Reordering in the dialog must be preserved.");
+
+    // Duplicate sensor sets make the content key ambiguous; falling back to the draft is defined
+    // behaviour, not an accident.
+    Check.Sequence(new[] { "A", "A" }, Sensors(Merge(Icons("A"), Icons("A", "A"), Icons("A", "B"))),
+        "Ambiguous duplicate keys should fall back to the draft.");
+}
+
+/// <summary>
+/// ExtractAssociatedIcon transfers ownership of a real HICON. Form.Dispose does not release an Icon
+/// it was merely assigned, so every window that extracts one has to hold and free it.
+/// </summary>
+static void WindowIconOwnershipTests()
+{
+    foreach (Type type in new[] { typeof(SettingsForm), typeof(EcExplorerForm) })
+    {
+        FieldInfo? field = type.GetField("_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
+        Check.True(field is not null, $"{type.Name} should retain the icon it extracts.");
+        Check.True(field!.FieldType == typeof(Icon), $"{type.Name}'s window icon field should be an Icon.");
+
+        MethodInfo? dispose = type.GetMethod("Dispose", BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null, new[] { typeof(bool) }, modifiers: null);
+        Check.True(dispose is not null && dispose.DeclaringType == type,
+            $"{type.Name} should override Dispose(bool) to release it.");
+    }
+
+    // The behaviour itself: an extracted icon is a live handle, and disposing it must invalidate it.
+    Icon? icon = null;
+    try { icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+    catch { /* no shell icon available; the structural checks above still hold */ }
+    if (icon is null) return;
+
+    Check.True(icon.Handle != IntPtr.Zero, "An extracted icon should carry a live handle.");
+    icon.Dispose();
+    bool disposed = false;
+    try { _ = icon.Handle; } catch (ObjectDisposedException) { disposed = true; }
+    Check.True(disposed, "Disposing an extracted icon should release it.");
+}
+
+/// <summary>
+/// The tray canvas is the shell's small-icon size, which moves when the display scale changes. It
+/// used to be fixed for the process lifetime, leaving icons rendered at the startup DPI.
+/// </summary>
+static void TrayCanvasDpiTests()
+{
+    int original = IconRenderer.CurrentCanvasSize;
+    Check.True(original > 0, "The canvas should have a real size before any change.");
+
+    try
+    {
+        IconRenderer.SetCanvasSizeProviderForTests(() => 24);
+        Check.Equal(24, IconRenderer.CurrentCanvasSize, "A changed shell metric should be adopted.");
+        using (Icon larger = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false))
+            Check.Equal(new Size(24, 24), larger.Size, "Icons should render at the new canvas size.");
+        Check.True(!IconRenderer.RefreshMetrics(), "An unchanged metric must not force a re-render.");
+
+        IconRenderer.SetCanvasSizeProviderForTests(() => 16);
+        Check.Equal(16, IconRenderer.CurrentCanvasSize, "A later change should be adopted too.");
+        using (Icon smaller = IconRenderer.RenderText("42", Color.White, Color.Transparent, bold: false))
+            Check.Equal(new Size(16, 16), smaller.Size,
+                "Font and path caches sized against the old canvas must be rebuilt, not reused.");
+    }
+    finally
+    {
+        IconRenderer.SetCanvasSizeProviderForTests(null);
+    }
+    Check.Equal(original, IconRenderer.CurrentCanvasSize, "Clearing the test seam should restore the real size.");
 }
 
 static object? PrivateField(object instance, string name)
