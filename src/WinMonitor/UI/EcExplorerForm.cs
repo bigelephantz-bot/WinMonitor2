@@ -739,6 +739,52 @@ public sealed class EcExplorerForm : Form
             return (headerX, headerY, cw, ch);
         }
 
+        // Per-paint GDI churn used to be roughly 264 objects a second while the explorer was open:
+        // two fonts, two brushes, three pens, a StringFormat, and one SolidBrush per cell. All of
+        // them are cached now. The cell brush is recoloured in place rather than drawn from a fixed
+        // palette because the "recently changed" highlight fades through alpha.
+        private Font? _cellFont;
+        private float _cellFontSize;
+        private Font? _headFont;
+        private SolidBrush? _headBrush, _textBrush, _cellBrush;
+        private Pen? _gridPen, _selPen, _findPen;
+        private StringFormat? _fmt;
+
+        private void EnsureResources(float cellFontSize)
+        {
+            if (_cellFont is null || Math.Abs(_cellFontSize - cellFontSize) > 0.01f)
+            {
+                _cellFont?.Dispose();
+                _cellFont = new Font("Segoe UI", cellFontSize);
+                _cellFontSize = cellFontSize;
+            }
+            _headFont ??= new Font("Consolas", 8f);
+            _headBrush ??= new SolidBrush(SystemColors.GrayText);
+            _textBrush ??= new SolidBrush(SystemColors.ControlText);
+            _cellBrush ??= new SolidBrush(SystemColors.Window);
+            _gridPen ??= new Pen(Color.FromArgb(225, 225, 225));
+            _selPen ??= new Pen(Color.FromArgb(0, 120, 215), 2f);
+            _findPen ??= new Pen(Color.FromArgb(0, 153, 51), 2f);
+            _fmt ??= new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _cellFont?.Dispose(); _cellFont = null;
+                _headFont?.Dispose(); _headFont = null;
+                _headBrush?.Dispose(); _headBrush = null;
+                _textBrush?.Dispose(); _textBrush = null;
+                _cellBrush?.Dispose(); _cellBrush = null;
+                _gridPen?.Dispose(); _gridPen = null;
+                _selPen?.Dispose(); _selPen = null;
+                _findPen?.Dispose(); _findPen = null;
+                _fmt?.Dispose(); _fmt = null;
+            }
+            base.Dispose(disposing);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -747,14 +793,11 @@ public sealed class EcExplorerForm : Form
             if (cw <= 2 || ch <= 2) return;
 
             long now = Environment.TickCount64;
-            using var font = new Font("Segoe UI", Math.Max(6.5f, Math.Min(9f, ch * 0.32f)));
-            using var headFont = new Font("Consolas", 8f);
-            using var headBrush = new SolidBrush(SystemColors.GrayText);
-            using var textBrush = new SolidBrush(SystemColors.ControlText);
-            using var gridPen = new Pen(Color.FromArgb(225, 225, 225));
-            using var selPen = new Pen(Color.FromArgb(0, 120, 215), 2f);
-            using var findPen = new Pen(Color.FromArgb(0, 153, 51), 2f);
-            var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            EnsureResources(Math.Max(6.5f, Math.Min(9f, ch * 0.32f)));
+            Font font = _cellFont!, headFont = _headFont!;
+            SolidBrush headBrush = _headBrush!, textBrush = _textBrush!, bgBrush = _cellBrush!;
+            Pen gridPen = _gridPen!, selPen = _selPen!, findPen = _findPen!;
+            StringFormat fmt = _fmt!;
 
             for (int c = 0; c < Grid; c++)
                 g.DrawString(c.ToString("X"), headFont, headBrush, new RectangleF(ox + c * cw, 2, cw, oy), fmt);
@@ -780,7 +823,8 @@ public sealed class EcExplorerForm : Form
                         bg = Color.FromArgb(Math.Max(30, a), 255, 214, 102); // fading amber
                     }
                 }
-                using (var bgBrush = new SolidBrush(bg)) g.FillRectangle(bgBrush, rect);
+                if (bgBrush.Color != bg) bgBrush.Color = bg;
+                g.FillRectangle(bgBrush, rect);
                 g.DrawRectangle(gridPen, rect);
 
                 string txt = ok ? Values[i].ToString("X2") : "··";
@@ -789,7 +833,6 @@ public sealed class EcExplorerForm : Form
                 if (find) g.DrawRectangle(findPen, rect.X + 1, rect.Y + 1, rect.Width - 2, rect.Height - 2);
                 if (i == _selected) g.DrawRectangle(selPen, rect.X + 1, rect.Y + 1, rect.Width - 2, rect.Height - 2);
             }
-            fmt.Dispose();
         }
     }
 
