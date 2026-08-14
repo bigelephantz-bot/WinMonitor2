@@ -244,12 +244,15 @@ public sealed partial class SettingsForm
             // sensors, and Cancel here has to be able to undo that like any other setting. The
             // hardware accessor stays live — reading registers is how the explorer finds them —
             // but the resulting definitions only reach the poll thread when Apply publishes them.
+            // LatestCpuThermal supplies BOTH package temperature and total CPU load. The previous
+            // callback hard-coded NaN for load, which silently disabled half the correlation
+            // finder: every candidate register was ranked against temperature only, and a
+            // load-correlated register (which is what a fan tacho looks like) could never surface.
             using var form = new EcExplorerForm(
                 _ctx.Sensors.Ec,
                 Config.Ec,
                 OnDraftEcSensorsChanged,
-                () => (_ctx.Stats.GetLatestValue(SensorPicker.PickAuto(_ctx.Sensors.Descriptors) ?? "") ?? float.NaN,
-                       float.NaN));
+                _ctx.LatestCpuThermal);
             form.ShowDialog(this);
         }
         catch (Exception ex)

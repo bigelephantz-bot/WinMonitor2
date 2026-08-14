@@ -44,6 +44,11 @@ Each of these looks like a defect and is not. Changing one is a regression.
 2. **Most exceptions are swallowed on purpose.** A sensor backend failing must degrade, never
    surface a dialog. The correct change to a swallowing path is to add a `Diag.Log` breadcrumb, not
    a rethrow.
+2b. **A native object an abandoned call may still be using is kept alive on purpose.** Not disposing
+   it is not enough — dropping the last managed reference lets a finalizer close the same handle the
+   call is inside. `EmbeddedController` pins those objects for the process lifetime; that list is
+   not a leak to tidy up. See `NativeCallGate` and `PollThreadHandle` for the same rule at their
+   own boundaries.
 3. **Chart history backfill runs on a worker thread and can be discarded.** The reset-generation
    check in `StatsTracker` is the guard against a peak reset landing mid-backfill — not a leftover.
 4. **`EmbeddedController` never writes the EC.** Read-only is a safety boundary, not an omission.
