@@ -38,6 +38,12 @@ public sealed class SensorDescriptor
     public required SensorCategory Category { get; init; }
     public required SensorQuantity Quantity { get; init; }
 
+    /// <summary>
+    /// Runtime measurement semantics, separate from the stable configuration id. Changing a
+    /// calibration starts a new session history revision without breaking tray/chart settings.
+    /// </summary>
+    public string MeasurementKey { get; init; } = "";
+
     /// <summary>Display name honoring user rename override; set by consumers, not by SensorService.</summary>
     public string DisplayName { get; set; } = "";
 

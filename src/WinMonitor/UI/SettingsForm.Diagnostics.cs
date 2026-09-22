@@ -66,16 +66,6 @@ public sealed partial class SettingsForm
         };
         openLog.Click += (_, _) => OpenDiagnosticLog();
 
-        // The EC register explorer has no other entry point since the LG 16T90R fan map became a
-        // built-in default. It stays reachable here because every other machine still needs it.
-        var ecExplorer = new Button
-        {
-            Text = Loc.T("set.diag.ec_explorer"),
-            AutoSize = true,
-            Margin = new Padding(0, 10, 0, 0),
-        };
-        ecExplorer.Click += (_, _) => OpenEcExplorer();
-
         var actions = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -86,12 +76,10 @@ public sealed partial class SettingsForm
         };
         actions.Controls.Add(copy);
         actions.Controls.Add(openLog);
-        actions.Controls.Add(ecExplorer);
 
         SetOptionToolTip("tip.diagnostics.hint", hint, _diagnosticsText);
         SetOptionToolTip("tip.diagnostics.copy", copy);
         SetOptionToolTip("tip.diagnostics.open_log", openLog);
-        SetOptionToolTip("tip.diagnostics.ec_explorer", ecExplorer);
         layout.Controls.Add(hint, 0, 0);
         layout.Controls.Add(_diagnosticsText, 0, 1);
         layout.Controls.Add(actions, 0, 2);
@@ -236,39 +224,4 @@ public sealed partial class SettingsForm
         }
     }
 
-    private void OpenEcExplorer()
-    {
-        try
-        {
-            // Edits go into this dialog's draft, not the live config: the explorer adds and removes
-            // sensors, and Cancel here has to be able to undo that like any other setting. The
-            // hardware accessor stays live — reading registers is how the explorer finds them —
-            // but the resulting definitions only reach the poll thread when Apply publishes them.
-            // LatestCpuThermal supplies BOTH package temperature and total CPU load. The previous
-            // callback hard-coded NaN for load, which silently disabled half the correlation
-            // finder: every candidate register was ranked against temperature only, and a
-            // load-correlated register (which is what a fan tacho looks like) could never surface.
-            using var form = new EcExplorerForm(
-                _ctx.Sensors.Ec,
-                Config.Ec,
-                OnDraftEcSensorsChanged,
-                _ctx.LatestCpuThermal);
-            form.ShowDialog(this);
-        }
-        catch (Exception ex)
-        {
-            Diag.Log("ec", "EC explorer failed to open", ex);
-            MessageBox.Show(this, ex.Message, Loc.T("common.error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-    }
-
-    /// <summary>
-    /// The explorer changed the draft's EC sensor list. Nothing is published here — the Sensors tab
-    /// is reloaded so the new definitions are visible, and Apply is what reaches the poll thread.
-    /// </summary>
-    private void OnDraftEcSensorsChanged()
-    {
-        Config.Ec.Enabled = Config.Ec.Enabled || Config.Ec.Sensors.Count > 0;
-        if (!IsDisposed && !Disposing) LoadAllTabs();
-    }
 }

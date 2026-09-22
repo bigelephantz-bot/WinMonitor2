@@ -66,7 +66,7 @@ public sealed class MainForm : Form
     private readonly Dictionary<string, Thresholds> _thresholdsById = new(StringComparer.Ordinal);
     private readonly HashSet<string> _temperatureIds = new(StringComparer.Ordinal);
     private readonly List<ChartSeriesSource> _chartSources = new();
-    private readonly Func<string, long, HistoryReadResult> _displayHistoryProvider;
+    private readonly ChartHistoryWindowProvider _displayHistoryProvider;
     private readonly Action _processSnapshotsAction;   // cached: no delegate alloc per poll tick
 
     private SensorSnapshot[]? _pendingSnapshots;   // latest-wins mailbox, written on the sensor thread
@@ -863,6 +863,9 @@ public sealed class MainForm : Form
             if (def is not null)
                 _chartSources.Add(MakeChartSource(def, ChartPalette[0]));
         }
+        var historyIds = new string[_chartSources.Count];
+        for (int i = 0; i < historyIds.Length; i++) historyIds[i] = _chartSources[i].Id;
+        _ctx.Stats.ArmHistories(historyIds);
         _chart.SetSources(_chartSources, _displayHistoryProvider, _ctx.Config.ChartMinutes);
     }
 
@@ -901,16 +904,15 @@ public sealed class MainForm : Form
     /// History for the chart. Temperatures are converted to the display unit here so the
     /// chart itself stays unit-agnostic; other quantities are passed through raw.
     /// </summary>
-    private HistoryReadResult ProvideDisplayHistory(string id, long knownVersion)
+    private HistoryWindowReadResult ProvideDisplayHistory(
+        string id, DateTime fromUtc, ref TimedValue[] buffer, long knownVersion)
     {
-        HistoryReadResult result = _ctx.Stats.GetHistoryIfChanged(id, knownVersion);
-        TimedValue[]? history = result.Values;
-        if (history is null || !Units.UseFahrenheit || !_temperatureIds.Contains(id) || history.Length == 0)
+        HistoryWindowReadResult result = _ctx.Stats.CopyVisibleWindow(id, fromUtc, ref buffer, knownVersion);
+        if (!Units.UseFahrenheit || !_temperatureIds.Contains(id))
             return result;
-        var converted = new TimedValue[history.Length];
-        for (int i = 0; i < history.Length; i++)
-            converted[i] = new TimedValue(history[i].Utc, Units.ToDisplayTemp(history[i].Value));
-        return new HistoryReadResult(result.Version, converted);
+        for (int i = 0; i < result.Count; i++)
+            buffer[i] = new TimedValue(buffer[i].Utc, Units.ToDisplayTemp(buffer[i].Value));
+        return result;
     }
 
     // =========================================================================
@@ -1053,31 +1055,13 @@ public sealed class MainForm : Form
             FileName = "winmonitor-timeseries-" + DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + ".csv",
         };
         if (dlg.ShowDialog(this) != DialogResult.OK) return;
-        var descriptors = new SensorDescriptor[_ctx.Sensors.Descriptors.Count];
-        for (int i = 0; i < descriptors.Length; i++)
-        {
-            SensorDescriptor source = _ctx.Sensors.Descriptors[i];
-            descriptors[i] = new SensorDescriptor
-            {
-                Id = source.Id,
-                HardwareName = source.HardwareName,
-                Name = source.Name,
-                DisplayName = source.DisplayName,
-                Category = source.Category,
-                Quantity = source.Quantity,
-                AmbiguousName = source.AmbiguousName,
-            };
-        }
-
         _exportButton.Enabled = false;
         _exportCsvItem.Enabled = false;
-        _ctx.BeginExport();
         try
         {
             // Raw values keep CSV units stable even if the display uses Fahrenheit. Disk-backed
             // history is streamed on a worker so a long-running session cannot freeze the UI.
-            string path = await Task.Run(
-                () => _ctx.Stats.ExportTimeSeriesCsv(dlg.FileName, descriptors));
+            string path = await _ctx.ExportTimeSeriesCsvAsync(dlg.FileName);
             if (IsDisposed || Disposing) return;
             string message = Loc.F("main.export_done", path);
             if (_ctx.Stats.SessionHistoryTruncated)
@@ -1093,7 +1077,6 @@ public sealed class MainForm : Form
         }
         finally
         {
-            _ctx.EndExport();
             if (!IsDisposed && !Disposing)
             {
                 _exportButton.Enabled = true;

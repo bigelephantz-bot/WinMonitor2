@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Text.Json;
 using WinMonitor.Config;
 using WinMonitor.Core;
@@ -137,7 +136,7 @@ public sealed class WinMonitorContext : ApplicationContext
     private volatile bool _exiting;
     private bool _sessionEndingHooked;
     private bool _powerModeHooked;
-    private bool _displaySettingsHooked;
+    private DisplayMetricsSubscription? _displayMetricsSubscription;
 
     // Auto peak reset (item 15): 1-minute schedule check + a guard so one target minute
     // never triggers twice. -1 = never auto-reset this session.
@@ -150,11 +149,11 @@ public sealed class WinMonitorContext : ApplicationContext
     // CSV export lifetime is tracked here, not on MainForm. Closing to the tray and a theme change
     // both dispose that form while the export worker keeps running, and a disposed form cannot tell
     // ExitApp that a write is still in flight.
-    private int _exportsInProgress;
+    private readonly SessionExportCoordinator _exports = new();
 
     // EC sensor definitions now travel with the settings draft, so an Apply has to publish them to
     // the poll thread. Compared against the last applied set to avoid a descriptor rebuild per Apply.
-    private string _appliedEcSignature = "";
+    private readonly EcSettingsPublisher _ecSettingsPublisher;
     private long _lastAutoPeakResetTick = -1;
 
     // Throttle-indicator enabled state at the last ApplySettings. When it flips, the descriptor
@@ -165,16 +164,6 @@ public sealed class WinMonitorContext : ApplicationContext
     // UI thread, and discard superseded requests before they touch the registry/task scheduler.
     private readonly SemaphoreSlim _startupRegistrationGate = new(1, 1);
     private int _startupRegistrationGeneration;
-
-    // Latest CPU package temperature / total load, published for the EC finder (see LatestCpuThermal).
-    // Written on the snapshot (background) thread; read on the UI thread by the EC Explorer.
-    private volatile float _lastCpuTemp = float.NaN;
-    private volatile float _lastCpuLoad = float.NaN;
-    // Cached descriptor ids so OnSnapshot doesn't rescan the descriptor list each tick; recomputed
-    // only when the Descriptors reference changes (rescan / EC edit).
-    private object? _cpuThermalDescriptorsRef;
-    private string? _cpuTempId;
-    private string? _cpuLoadId;
 
     public WinMonitorContext(AppConfig config, bool startMinimized)
     {
@@ -187,9 +176,7 @@ public sealed class WinMonitorContext : ApplicationContext
 
         Sensors = new SensorService(() => Config);
         _requestLoggingSweep = () => Sensors.RequestFullSweep();
-        // Start() below already snapshots this config's EC sensors; recording the signature here
-        // keeps the first Apply from forcing a redundant descriptor rebuild.
-        _appliedEcSignature = DescribeEcConfig(config.Ec);
+        _ecSettingsPublisher = new EcSettingsPublisher(config.Ec, Sensors.RefreshEcSensors);
         Stats = new StatsTracker();
         Alerts = new AlertEngine(() => Config);
         Logger = new HistoryLogger(() => Config, () => Sensors.Descriptors);
@@ -232,11 +219,12 @@ public sealed class WinMonitorContext : ApplicationContext
 
         // A display-scale change alters the shell's small-icon size, which the tray renders at.
         // Without this the icons stay at the startup DPI until the app restarts.
-        if (!_displaySettingsHooked)
-        {
-            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
-            _displaySettingsHooked = true;
-        }
+        _displayMetricsSubscription = new DisplayMetricsSubscription(
+            InvokeOnUi, IconRenderer.RefreshMetrics, () =>
+            {
+                Diag.Log("tray", "Shell icon size changed; re-rendering tray icons");
+                Tray.Rebuild(Sensors.Descriptors);
+            });
 
         ApplyEffectivePollInterval();
 
@@ -264,25 +252,22 @@ public sealed class WinMonitorContext : ApplicationContext
     /// True while any CSV export worker is running. Owned by the context because every window that
     /// can start an export can also be disposed while it runs (close-to-tray, theme recreation).
     /// </summary>
-    public bool IsExportInProgress => Volatile.Read(ref _exportsInProgress) > 0;
+    public bool IsExportInProgress => _exports.IsExportInProgress;
 
-    /// <summary>Brackets an export so <see cref="ExitApp"/> can see it from anywhere.</summary>
-    internal void BeginExport() => Interlocked.Increment(ref _exportsInProgress);
-
-    internal void EndExport() => Interlocked.Decrement(ref _exportsInProgress);
+    internal Task<string> ExportTimeSeriesCsvAsync(string path)
+        => _exports.RunAsync(() => Stats.ExportTimeSeriesCsv(path));
 
     // ---------- data fan-out ----------
 
     private void OnSnapshot(SensorSnapshot[] snapshots, bool complete)
     {
         // Background thread. Order matters: stats first so consumers see fresh min/max.
-        Stats.Accept(snapshots);
+        Stats.Accept(snapshots, Sensors.Descriptors);
         Alerts.Accept(snapshots, Sensors.Descriptors);
         Tray.Accept(snapshots);
         // Only background CSV needs a complete picture; everything above is happy with whatever
         // smart polling sampled this tick. The cached delegate keeps the per-tick path allocation-free.
         Logger.Accept(snapshots, complete, _requestLoggingSweep);
-        UpdateCpuThermal(snapshots);
 
         var main = _mainForm;
         if (main is { IsDisposed: false, Visible: true }) main.AcceptSnapshots(snapshots);
@@ -291,51 +276,6 @@ public sealed class WinMonitorContext : ApplicationContext
         var fly = _flyout;
         if (fly is { IsDisposed: false, Visible: true }) fly.AcceptSnapshots(snapshots);
     }
-
-    /// <summary>
-    /// Publishes the latest CPU package temp and CPU total load for the EC finder. Runs on the
-    /// background snapshot thread. Descriptor ids are cached and only recomputed when the
-    /// Descriptors reference changes, so the per-tick cost is a couple of linear scans.
-    /// </summary>
-    private void UpdateCpuThermal(SensorSnapshot[] snapshots)
-    {
-        var descriptors = Sensors.Descriptors;
-        if (!ReferenceEquals(descriptors, _cpuThermalDescriptorsRef))
-        {
-            _cpuThermalDescriptorsRef = descriptors;
-            _cpuTempId = SensorPicker.PickAuto(descriptors);
-            _cpuLoadId = null;
-            for (int i = 0; i < descriptors.Count; i++)
-            {
-                var d = descriptors[i];
-                if (d.Category == SensorCategory.Cpu && d.Quantity == SensorQuantity.Load)
-                {
-                    _cpuLoadId = d.Id;
-                    break;
-                }
-            }
-        }
-
-        _lastCpuTemp = ReadSnapshotValue(snapshots, _cpuTempId);
-        _lastCpuLoad = ReadSnapshotValue(snapshots, _cpuLoadId);
-    }
-
-    private static float ReadSnapshotValue(SensorSnapshot[] snapshots, string? id)
-    {
-        if (id is null) return float.NaN;
-        for (int i = 0; i < snapshots.Length; i++)
-        {
-            if (snapshots[i].Id == id)
-            {
-                float? v = snapshots[i].Value;
-                return v.HasValue ? v.Value : float.NaN;
-            }
-        }
-        return float.NaN;
-    }
-
-    /// <summary>Latest CPU package temperature / total load (NaN when unavailable). Thread-safe.</summary>
-    public (float temp, float load) LatestCpuThermal() => (_lastCpuTemp, _lastCpuLoad);
 
     private void OnDescriptorsChanged()
     {
@@ -354,8 +294,10 @@ public sealed class WinMonitorContext : ApplicationContext
 
     private void RefreshDisplayNames()
     {
-        foreach (var d in Sensors.Descriptors)
+        var descriptors = Sensors.Descriptors;
+        foreach (var d in descriptors)
             d.DisplayName = Config.DisplayNameFor(d);
+        Stats.RegisterDescriptors(descriptors);
     }
 
     /// <summary>
@@ -481,29 +423,6 @@ public sealed class WinMonitorContext : ApplicationContext
             _mainForm.Activate();
             UpdateActiveSensorSet();
         });
-    }
-
-    // The EC Explorer used to have a second entry point here that opened it against the LIVE
-    // config. It had no callers once the Diagnostics tab became the only way in, and it
-    // contradicted that path's draft semantics: edits made through it could not be undone by
-    // Cancel. Removed rather than left as a working shortcut back to mutating the live config.
-
-    /// <summary>
-    /// Stable text form of the EC sensor set, used only to decide whether an Apply actually changed
-    /// it. Cheap enough for a settings apply and avoids a descriptor rebuild on every OK press.
-    /// </summary>
-    private static string DescribeEcConfig(EcConfig ec)
-    {
-        if (ec is null) return "off";
-        var sb = new StringBuilder(32 + ec.Sensors.Count * 24);
-        sb.Append(ec.Enabled ? '1' : '0');
-        foreach (EcSensorDef? sensor in ec.Sensors)
-        {
-            if (sensor is null) continue;
-            sb.Append('|').Append(sensor.SensorId).Append(':').Append(sensor.Quantity)
-              .Append(':').Append(sensor.Name).Append(':').Append(sensor.Divisor);
-        }
-        return sb.ToString();
     }
 
     public void ShowCompact()
@@ -718,15 +637,9 @@ public sealed class WinMonitorContext : ApplicationContext
             _lastThrottleEnabled = Config.ThrottleIndicatorEnabled;
             Sensors.RequestDescriptorRebuild();
         }
-        // EC sensor definitions are edited in the Settings draft (the EC Explorer opens from there),
-        // so publishing them to the poll thread is part of applying settings. RefreshEcSensors
-        // deep-copies on this thread, so the poll thread only ever sees an immutable snapshot.
-        string ecSignature = DescribeEcConfig(Config.Ec);
-        if (!string.Equals(ecSignature, _appliedEcSignature, StringComparison.Ordinal))
-        {
-            _appliedEcSignature = ecSignature;
-            Sensors.RefreshEcSensors(Config.Ec);
-        }
+        // Preserve persisted EC definitions and publish changes such as Restore defaults.
+        // RefreshEcSensors deep-copies here so the poll thread reads an immutable snapshot.
+        _ecSettingsPublisher.Apply(Config.Ec);
         QueueStartupRegistration(reportFailure: true);
         InvokeOnUi(() =>
         {
@@ -822,25 +735,9 @@ public sealed class WinMonitorContext : ApplicationContext
         Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged;
     }
 
-    /// <summary>
-    /// Display scale or layout changed: the shell's small-icon size may have moved, and every tray
-    /// icon is rendered at exactly that size. Re-render only when it actually changed.
-    /// </summary>
-    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
-    {
-        InvokeOnUi(() =>
-        {
-            if (!IconRenderer.RefreshMetrics()) return;
-            Diag.Log("tray", "Shell icon size changed; re-rendering tray icons");
-            Tray.Rebuild(Sensors.Descriptors);
-        });
-    }
-
     private void UnhookDisplaySettings()
     {
-        if (!_displaySettingsHooked) return;
-        _displaySettingsHooked = false;
-        Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        _displayMetricsSubscription?.Dispose();
     }
 
     public void ExitApp()
