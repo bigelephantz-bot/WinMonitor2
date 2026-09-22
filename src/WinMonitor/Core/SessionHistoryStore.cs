@@ -30,11 +30,11 @@ internal sealed class SessionHistoryReadSnapshot : IDisposable
     /// </summary>
     public bool IsReadable => _stream is not null;
 
-    public IEnumerable<SessionHistoryRecord> ReadRecords()
+    public IEnumerable<SessionHistoryRecord> ReadRecords(long startOffset = 0)
     {
         if (_stream is null) yield break;
 
-        _stream.Position = 0;
+        _stream.Position = Math.Clamp(startOffset - startOffset % RecordSize, 0, _length);
         using var reader = new BinaryReader(_stream, Encoding.UTF8, leaveOpen: true);
         while (_stream.Position + RecordSize <= _length)
         {
