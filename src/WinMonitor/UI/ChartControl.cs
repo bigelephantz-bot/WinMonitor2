@@ -19,6 +19,14 @@ public readonly record struct ChartSeriesSource(
     bool IsBoolean);
 
 /// <summary>
+/// Copies the visible history and one preceding boundary sample into a chart-owned buffer.
+/// Only the returned Count is valid; spare buffer capacity must never be plotted or formatted.
+/// The provider refreshes that prefix in display units on every call, including unchanged versions.
+/// </summary>
+public delegate HistoryWindowReadResult ChartHistoryWindowProvider(
+    string sensorId, DateTime fromUtc, ref TimedValue[] buffer, long knownVersion);
+
+/// <summary>
 /// Pure GDI+ history chart. Quantities with incompatible units are rendered in separate
 /// panes with independent Y scales. Percentage-based quantities share one pane. Series use
 /// both color and marker shape, and line hit testing exposes the sensor name in a tooltip.
@@ -59,7 +67,8 @@ public sealed class ChartControl : Control
     }
 
     private readonly List<ChartSeriesSource> _sources = new();
-    private readonly List<TimedValue[]?> _histories = new();
+    private readonly List<TimedValue[]> _histories = new();
+    private readonly List<int> _historyCounts = new();
     private readonly List<long> _historyVersions = new();
     private readonly List<PointF[]> _pointBuffers = new();
     private readonly List<int> _pointCounts = new();
@@ -67,7 +76,7 @@ public sealed class ChartControl : Control
     private readonly PointF[] _trianglePoints = new PointF[3];
     private readonly PointF[] _diamondPoints = new PointF[4];
     private readonly ToolTip _hoverTip;
-    private Func<string, long, HistoryReadResult>? _historyProvider;
+    private ChartHistoryWindowProvider? _historyProvider;
     private int _windowMinutes = 10;
     private int _hoverSeries = -1;
 
@@ -96,13 +105,14 @@ public sealed class ChartControl : Control
 
     /// <summary>Replaces the plotted series and rebuilds the quantity-pane layout.</summary>
     public void SetSources(IReadOnlyList<ChartSeriesSource> sources,
-                           Func<string, long, HistoryReadResult> historyProvider,
+                           ChartHistoryWindowProvider historyProvider,
                            int windowMinutes)
     {
         _hoverTip.Hide(this);
         _hoverSeries = -1;
         _sources.Clear();
         _histories.Clear();
+        _historyCounts.Clear();
         _historyVersions.Clear();
         _pointBuffers.Clear();
         _pointCounts.Clear();
@@ -112,7 +122,8 @@ public sealed class ChartControl : Control
         {
             ChartSeriesSource source = sources[i];
             _sources.Add(source);
-            _histories.Add(null);
+            _histories.Add(Array.Empty<TimedValue>());
+            _historyCounts.Add(0);
             _historyVersions.Add(-1);
             _pointBuffers.Add(Array.Empty<PointF>());
             _pointCounts.Add(0);
@@ -132,22 +143,23 @@ public sealed class ChartControl : Control
         RefreshData();
     }
 
-    /// <summary>Re-fetches changed histories and schedules a repaint.</summary>
+    /// <summary>Refreshes each visible window in its reusable buffer and schedules a repaint.</summary>
     public void RefreshData()
     {
         var provider = _historyProvider;
         if (provider is not null)
         {
+            DateTime start = DateTime.UtcNow.AddMinutes(-_windowMinutes);
             for (int i = 0; i < _sources.Count && i < _histories.Count; i++)
             {
                 try
                 {
-                    HistoryReadResult result = provider(_sources[i].Id, _historyVersions[i]);
-                    if (result.Values is not null)
-                    {
-                        _histories[i] = result.Values;
-                        _historyVersions[i] = result.Version;
-                    }
+                    TimedValue[] history = _histories[i];
+                    HistoryWindowReadResult result = provider(
+                        _sources[i].Id, start, ref history, _historyVersions[i]);
+                    _histories[i] = history;
+                    _historyCounts[i] = Math.Clamp(result.Count, 0, history.Length);
+                    _historyVersions[i] = result.Version;
                 }
                 catch
                 {
@@ -284,33 +296,46 @@ public sealed class ChartControl : Control
                             Rectangle plot, DateTime start, double windowSeconds,
                             float min, float range)
     {
-        TimedValue[]? history = _histories[seriesIndex];
-        if (history is null || history.Length == 0)
+        TimedValue[] history = _histories[seriesIndex];
+        int historyCount = _historyCounts[seriesIndex];
+        if (historyCount == 0)
             return;
 
-        int firstVisible = history.Length;
-        for (int i = history.Length - 1; i >= 0; i--)
-        {
-            if (history[i].Utc < start)
-                break;
-            firstVisible = i;
-        }
-
-        int visible = history.Length - firstVisible;
+        int firstVisible = FindFirstVisible(history, historyCount, start);
+        int visible = historyCount - firstVisible;
         if (visible <= 0)
             return;
 
         int maxPoints = Math.Max(2, plot.Width * 2);
         int stride = visible > maxPoints ? (visible + maxPoints - 1) / maxPoints : 1;
-        int capacity = (visible + stride - 1) / stride;
+        // One boundary point preserves the entering segment and one extra slot retains the
+        // newest sample when stride reduction does not land on it exactly.
+        int capacity = (visible + stride - 1) / stride + 2;
         PointF[] points = GetPointBuffer(seriesIndex, capacity);
         int count = 0;
 
-        for (int i = firstVisible; i < history.Length; i += stride)
+        if (firstVisible > 0 && TryBoundaryValue(history[firstVisible - 1], history[firstVisible],
+                                               start, out float boundaryValue))
+        {
+            // Interpolate at the pane edge instead of drawing the pre-window point over labels.
+            float y = plot.Bottom - (boundaryValue - min) / range * plot.Height;
+            points[count++] = new PointF(plot.Left, y);
+        }
+
+        int lastAdded = -1;
+        for (int i = firstVisible; i < historyCount; i += stride)
         {
             TimedValue sample = history[i];
             if (float.IsNaN(sample.Value) || float.IsInfinity(sample.Value))
                 continue;
+            float x = plot.Left + (float)((sample.Utc - start).TotalSeconds / windowSeconds) * plot.Width;
+            float y = plot.Bottom - (sample.Value - min) / range * plot.Height;
+            points[count++] = new PointF(x, y);
+            lastAdded = i;
+        }
+        if (lastAdded != historyCount - 1 && float.IsFinite(history[historyCount - 1].Value))
+        {
+            TimedValue sample = history[historyCount - 1];
             float x = plot.Left + (float)((sample.Utc - start).TotalSeconds / windowSeconds) * plot.Width;
             float y = plot.Bottom - (sample.Value - min) / range * plot.Height;
             points[count++] = new PointF(x, y);
@@ -410,9 +435,9 @@ public sealed class ChartControl : Control
             DrawMarker(g, left + 8f, y + rowHeight / 2f, source.Color, ShapeFor(i));
 
             string value = "—";
-            TimedValue[]? history = i < _histories.Count ? _histories[i] : null;
-            if (history is { Length: > 0 })
-                value = FormatDisplayValue(source, history[^1].Value);
+            int historyCount = _historyCounts[i];
+            if (historyCount > 0)
+                value = FormatDisplayValue(source, _histories[i][historyCount - 1].Value);
             string text = source.Name + "  " + value;
             var bounds = new Rectangle(left + 21, y, Math.Max(1, width - 21), rowHeight);
             TextRenderer.DrawText(g, text, Font, bounds, Theme.Text,
@@ -509,14 +534,21 @@ public sealed class ChartControl : Control
         {
             if (ScaleGroupFor(_sources[seriesIndex]) != group)
                 continue;
-            TimedValue[]? history = _histories[seriesIndex];
-            if (history is null)
+            TimedValue[] history = _histories[seriesIndex];
+            int historyCount = _historyCounts[seriesIndex];
+            int firstVisible = FindFirstVisible(history, historyCount, start);
+            if (firstVisible == historyCount)
                 continue;
-            for (int i = history.Length - 1; i >= 0; i--)
+            if (firstVisible > 0 && TryBoundaryValue(history[firstVisible - 1], history[firstVisible],
+                                                   start, out float boundaryValue))
+            {
+                if (boundaryValue < min) min = boundaryValue;
+                if (boundaryValue > max) max = boundaryValue;
+                any = true;
+            }
+            for (int i = firstVisible; i < historyCount; i++)
             {
                 TimedValue sample = history[i];
-                if (sample.Utc < start)
-                    break;
                 float value = sample.Value;
                 if (float.IsNaN(value) || float.IsInfinity(value))
                     continue;
@@ -526,6 +558,26 @@ public sealed class ChartControl : Control
             }
         }
         return any;
+    }
+
+    private static int FindFirstVisible(TimedValue[] history, int count, DateTime start)
+    {
+        int firstVisible = count;
+        for (int i = count - 1; i >= 0 && history[i].Utc >= start; i--)
+            firstVisible = i;
+        return firstVisible;
+    }
+
+    private static bool TryBoundaryValue(TimedValue before, TimedValue after, DateTime start,
+                                         out float value)
+    {
+        value = 0f;
+        long span = after.Utc.Ticks - before.Utc.Ticks;
+        if (span <= 0 || !float.IsFinite(before.Value) || !float.IsFinite(after.Value))
+            return false;
+        double fraction = (double)(start.Ticks - before.Utc.Ticks) / span;
+        value = (float)(before.Value + ((double)after.Value - before.Value) * fraction);
+        return float.IsFinite(value);
     }
 
     private void AddPaneIfPresent(ChartScaleGroup group)
@@ -757,6 +809,9 @@ public sealed class ChartControl : Control
             _seriesBrushes.Clear();
             _pointBuffers.Clear();
             _pointCounts.Clear();
+            _histories.Clear();
+            _historyCounts.Clear();
+            _historyVersions.Clear();
             _gridPen?.Dispose();
             _gridPen = null;
             _borderPen?.Dispose();

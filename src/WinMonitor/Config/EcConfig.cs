@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json.Serialization;
 using WinMonitor.Core;
 using WinMonitor.Localization;
 
@@ -14,9 +16,9 @@ public enum EcValueKind
 }
 
 /// <summary>
-/// A user-defined sensor mapped onto one or two EC registers, discovered with the EC Explorer.
-/// Because EC register maps are model-specific, definitions normally come from the EC Explorer.
-/// A small exact-model catalog may supply a firmware-verified default when available.
+/// A persisted sensor mapped onto one or two EC registers. Existing custom mappings are retained
+/// for compatibility; the application does not scan registers or provide a mapping editor.
+/// A small exact-model catalog supplies a firmware-verified default when available.
 /// </summary>
 public sealed class EcSensorDef
 {
@@ -33,6 +35,9 @@ public sealed class EcSensorDef
 
     /// <summary>Stable sensor id used across the app for this EC sensor.</summary>
     public string SensorId => "/ec/reg/" + Register.ToString("X2") + "/" + Kind;
+    [JsonIgnore]
+    public string MeasurementKey => string.Create(CultureInfo.InvariantCulture,
+        $"{Register:X2}|{(int)Kind}|{BigEndian}|{Scale:R}|{Offset:R}|{Divisor:R}|{(int)Quantity}");
     public string DisplayName => string.IsNullOrWhiteSpace(NameKey) ? Name : Loc.T(NameKey);
 
     public EcSensorDef Clone() => (EcSensorDef)MemberwiseClone();

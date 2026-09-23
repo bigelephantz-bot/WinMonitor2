@@ -2,6 +2,8 @@
 
 WinMonitor 透過 PawnIO **唯讀**存取 ACPI Embedded Controller（EC）。主程式不提供
 EC 探索器；已確認機型會由 `KnownEcProfiles` 自動套用風扇 register。
+一般監測只讀取設定中需要的 register，不進行全範圍掃描或關聯分析。既有 EC 感測器
+設定會繼續讀取，設定視窗不再提供探索器或 register 定義編輯功能。
 
 ## 已確認映射
 
@@ -33,6 +35,9 @@ dotnet run --project tools\SensorDump\SensorDump.csproj -c Release -- --report
 ## 支援其他機型
 
 開發者可先掃描 ACPI EC 欄位，再以閒置／負載／冷卻三階段進行唯讀取樣：
+
+以下為獨立工具，必須手動執行，WinMonitor 主程式不會自動啟動。`--ec-probe` 會在
+負載階段產生 CPU 負載；未指定 register 時會讀取完整 EC 範圍，執行期間有額外開銷。
 
 ```powershell
 dotnet run --project tools\SensorDump\SensorDump.csproj -c Release -- --acpi-ec-fields

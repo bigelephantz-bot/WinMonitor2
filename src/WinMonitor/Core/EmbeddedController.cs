@@ -29,7 +29,7 @@ namespace WinMonitor.Core;
 /// mutex forever, so the EC is disabled for the process and those objects are deliberately never
 /// disposed.
 /// </summary>
-public sealed class EmbeddedController : IDisposable
+public sealed class EmbeddedController : IDisposable, IEcSensorReader
 {
     // ACPI EC interface (ACPI spec §12).
     private const int EC_DATA = 0x62;   // read/write data register
@@ -40,7 +40,7 @@ public sealed class EmbeddedController : IDisposable
 
     private const int WaitStatusMaxMs = 10;      // per-handshake-step ceiling (was 100)
     private const int DefaultBudgetMs = 40;      // per block-read total budget (poll thread)
-    private const int ExplorerBudgetMs = 250;    // longer budget for the off-thread EC Explorer dump
+    private const int DiagnosticDumpBudgetMs = 250; // explicit standalone SensorDump probe only
     // Headroom over the budget before a call counts as wedged rather than merely slow: the batch
     // bounds its own waiting, so overshooting this can only mean a native call that did not return.
     private const int GateMarginMs = 250;
@@ -51,6 +51,7 @@ public sealed class EmbeddedController : IDisposable
 
     private readonly object _lock = new();
     private readonly NativeCallGate _gate = new("EcAccess");
+    private readonly int? _readGateTimeoutMs;
 
     // Batch buffers owned by the gate thread, never handed to a caller. A timed-out worker keeps
     // writing into whatever it was given, so the caller's arrays must not be the same objects;
@@ -70,11 +71,29 @@ public sealed class EmbeddedController : IDisposable
     // because the controller itself may be collected long before the call returns.
     private static readonly List<object> AbandonedNativeObjects = new();
 
-    private PawnIo? _pawn;
+    private IEcPortAccess? _pawn;
     private Mutex? _ecMutex;
     private bool _disposed;
+    private volatile bool _available;
 
-    public bool Available { get; private set; }
+    public bool Available { get => _available; private set => _available = value; }
+
+    public EmbeddedController() { }
+
+    /// <summary>
+    /// An already-open session for deterministic native-boundary regression checks. The same
+    /// RunRead/gate/batch/reset path is used as in production; no driver or named mutex is opened.
+    /// </summary>
+    internal EmbeddedController(IEcPortAccess pawn, Mutex mutex, int? readGateTimeoutMs = null)
+    {
+        ArgumentNullException.ThrowIfNull(pawn);
+        ArgumentNullException.ThrowIfNull(mutex);
+        if (readGateTimeoutMs is <= 0) throw new ArgumentOutOfRangeException(nameof(readGateTimeoutMs));
+        _pawn = pawn;
+        _ecMutex = mutex;
+        _readGateTimeoutMs = readGateTimeoutMs;
+        Available = true;
+    }
 
     /// <summary>Human-readable reason Available is false, for the UI. Null when available.</summary>
     public string? UnavailableReason { get; private set; }
@@ -130,6 +149,7 @@ public sealed class EmbeddedController : IDisposable
             {
                 // The call is still running and owns `pawn`; disposing it here would tear the
                 // handle out from under it.
+                Abandon(pawn);
                 UnavailableReason = "ec_wedged";
                 return false;
             }
@@ -209,8 +229,8 @@ public sealed class EmbeddedController : IDisposable
         return data;
     }
 
-    /// <summary>Full 256-byte dump for the EC Explorer (longer budget; call off the UI thread).</summary>
-    public byte[] Dump(out bool[] ok) => ReadBlock(0, 256, out ok, ExplorerBudgetMs);
+    /// <summary>Full 256-byte dump for an explicit standalone diagnostic; not used by app polling.</summary>
+    public byte[] Dump(out bool[] ok) => ReadBlock(0, 256, out ok, DiagnosticDumpBudgetMs);
 
     // ---------- internals ----------
 
@@ -226,7 +246,7 @@ public sealed class EmbeddedController : IDisposable
         try
         {
             if (_disposed || !Available) return;
-            PawnIo? pawn = _pawn;
+            IEcPortAccess? pawn = _pawn;
             Mutex? mutex = _ecMutex;
             if (pawn is null || mutex is null) return;
 
@@ -246,7 +266,7 @@ public sealed class EmbeddedController : IDisposable
             // using — and releasing — the exact objects it started with.
             bool completed = _gate.TryRun(
                 () => ReadBatch(pawn, mutex, addrs, workData, workFlags, sw, budgetMs),
-                budgetMs + GateMarginMs);
+                _readGateTimeoutMs ?? budgetMs + GateMarginMs);
             PublishBatch(completed, workData, workFlags, data, flags);
             if (!completed) MarkWedgedLocked(pawn, mutex, workData, workFlags);
         }
@@ -272,7 +292,7 @@ public sealed class EmbeddedController : IDisposable
     }
 
     /// <summary>Runs on the gate's thread: acquires the shared mutex and walks the registers.</summary>
-    private void ReadBatch(PawnIo pawn, Mutex mutex, int[] addrs, byte[] data, bool[] flags,
+    private void ReadBatch(IEcPortAccess pawn, Mutex mutex, int[] addrs, byte[] data, bool[] flags,
         Stopwatch sw, int budgetMs)
     {
         // Released through the captured reference, not the field: a Reset during a wedged call
@@ -306,7 +326,7 @@ public sealed class EmbeddedController : IDisposable
     /// pinned for the process lifetime: not disposing is not enough on its own, because dropping
     /// the last reference lets a finalizer close the same handle the call is inside.
     /// </summary>
-    private void MarkWedgedLocked(PawnIo pawn, Mutex mutex, byte[] workData, bool[] workFlags)
+    private void MarkWedgedLocked(IEcPortAccess pawn, Mutex mutex, byte[] workData, bool[] workFlags)
     {
         Abandon(pawn);
         Abandon(mutex);
@@ -334,7 +354,7 @@ public sealed class EmbeddedController : IDisposable
     /// Discards a byte the EC/ACPI driver may have left in the output buffer before we start our
     /// own handshake, so the first register read cannot return a stale query/burst byte.
     /// </summary>
-    private void DrainObf(PawnIo pawn, Stopwatch sw, int budgetMs)
+    private void DrainObf(IEcPortAccess pawn, Stopwatch sw, int budgetMs)
     {
         if (sw.ElapsedMilliseconds >= budgetMs) return;
         if (ReadPort(pawn, EC_SC, out byte status) && (status & STATUS_OBF) != 0)
@@ -342,7 +362,7 @@ public sealed class EmbeddedController : IDisposable
     }
 
     /// <summary>ACPI EC read protocol. Assumes the Access_EC mutex is already held.</summary>
-    private bool TryReadRegisterNoMutex(PawnIo pawn, int address, Stopwatch sw, int budgetMs, out byte value)
+    private bool TryReadRegisterNoMutex(IEcPortAccess pawn, int address, Stopwatch sw, int budgetMs, out byte value)
     {
         value = 0;
         if (!WaitStatus(pawn, STATUS_IBF, desiredSet: false, sw, budgetMs)) return false; // EC not busy
@@ -358,7 +378,7 @@ public sealed class EmbeddedController : IDisposable
     /// Polls the EC status port until the flag reaches the desired state. Bounded by both a
     /// short per-step ceiling and the caller's overall budget, so it can never busy-spin long.
     /// </summary>
-    private bool WaitStatus(PawnIo pawn, byte flag, bool desiredSet, Stopwatch overall, int budgetMs)
+    private bool WaitStatus(IEcPortAccess pawn, byte flag, bool desiredSet, Stopwatch overall, int budgetMs)
     {
         long stepDeadline = overall.ElapsedMilliseconds + WaitStatusMaxMs;
         while (true)
@@ -374,7 +394,7 @@ public sealed class EmbeddedController : IDisposable
     // Both port helpers run only on the gate thread, inside one batch, so the shared scratch
     // buffers below are never touched concurrently. Reusing them removes ~10 array allocations
     // per register read from a path that runs on the poll thread.
-    private bool ReadPort(PawnIo pawn, int port, out byte value)
+    private bool ReadPort(IEcPortAccess pawn, int port, out byte value)
     {
         value = 0;
         _portInput[0] = (ulong)port;
@@ -384,7 +404,7 @@ public sealed class EmbeddedController : IDisposable
         return true;
     }
 
-    private bool WritePort(PawnIo pawn, int port, byte value)
+    private bool WritePort(IEcPortAccess pawn, int port, byte value)
     {
         // Writes here target ONLY the EC command/data ports as part of the read handshake
         // (RD_EC command + address byte). We never issue WR_EC (0x81), so no EC register is modified.

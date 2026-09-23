@@ -194,7 +194,7 @@ public sealed class HistoryLogger : IDisposable
     /// Streams a disk-backed session snapshot as a wide time series. Memory use depends only on
     /// descriptor count, not session duration; records are already in polling-time order.
     /// </summary>
-    internal static string ExportTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
+    internal static string ExportTimeSeriesCsv(string path, IReadOnlyList<SessionSensorInfo> descriptors,
         SessionHistoryReadSnapshot snapshot)
     {
         // An unreadable spool must not look like an empty session: both produce a header and no
@@ -222,12 +222,12 @@ public sealed class HistoryLogger : IDisposable
         }
     }
 
-    private static void WriteTimeSeriesCsv(string path, IReadOnlyList<SensorDescriptor> descriptors,
+    private static void WriteTimeSeriesCsv(string path, IReadOnlyList<SessionSensorInfo> descriptors,
         SessionHistoryReadSnapshot snapshot)
     {
         var descriptorIndexById = new Dictionary<string, int>(descriptors.Count, StringComparer.Ordinal);
         for (int i = 0; i < descriptors.Count; i++)
-            descriptorIndexById[descriptors[i].Id] = i;
+            descriptorIndexById[descriptors[i].HistoryId] = i;
 
         var columnsBySensorIndex = new int[snapshot.SensorIds.Length];
         Array.Fill(columnsBySensorIndex, -1);
@@ -275,7 +275,7 @@ public sealed class HistoryLogger : IDisposable
     }
 
     private static void WriteSessionRow(StreamWriter writer, StringBuilder sb, long timestamp,
-        IReadOnlyList<SensorDescriptor> descriptors, float[] values, bool[] present)
+        IReadOnlyList<SessionSensorInfo> descriptors, float[] values, bool[] present)
     {
         sb.Clear();
         sb.Append(new DateTime(timestamp, DateTimeKind.Utc).ToLocalTime()
@@ -284,7 +284,7 @@ public sealed class HistoryLogger : IDisposable
         {
             sb.Append(',');
             if (!present[i]) continue;
-            if (string.Equals(descriptors[i].Id, WellKnown.ThrottleSensorId, StringComparison.Ordinal))
+            if (string.Equals(descriptors[i].SourceId, WellKnown.ThrottleSensorId, StringComparison.Ordinal))
                 sb.Append(values[i] >= 0.5f ? "True" : "False");
             else
                 sb.Append(values[i].ToString(CultureInfo.InvariantCulture));
@@ -292,13 +292,15 @@ public sealed class HistoryLogger : IDisposable
         writer.WriteLine(sb.ToString());
     }
 
-    private static string ExportColumnName(SensorDescriptor descriptor)
+    private static string ExportColumnName(SessionSensorInfo descriptor)
     {
-        string quantity = string.Equals(descriptor.Id, WellKnown.ThrottleSensorId,
+        string quantity = string.Equals(descriptor.SourceId, WellKnown.ThrottleSensorId,
                                         StringComparison.Ordinal)
             ? "Boolean"
             : descriptor.Quantity.ToString();
-        return descriptor.HardwareName + " / " + DisplayNameOf(descriptor) + " [" + quantity + "]";
+        string revision = descriptor.Revision > 1
+            ? " [v" + descriptor.Revision.ToString(CultureInfo.InvariantCulture) + "]" : string.Empty;
+        return descriptor.HardwareName + " / " + descriptor.DisplayName + " [" + quantity + "]" + revision;
     }
 
     // ---------- internals ----------
@@ -411,9 +413,10 @@ public sealed class HistoryLogger : IDisposable
             AppendFingerprintField(sb, DisplayNameOf(d));
             // Quantity is what the numbers in the column MEAN, and it is not implied by the id.
             // An EC sensor id is "/ec/reg/XX/{Kind}", so switching one from Fan to Temperature in
-            // the EC Explorer keeps the id, the name and the header text identical while the
+            // an EC definition edit keeps the id, the name and the header text identical while the
             // column silently changes from RPM to °C. Identity has to include the unit.
             AppendFingerprintField(sb, d.Quantity.ToString());
+            AppendFingerprintField(sb, d.MeasurementKey);
         }
         return sb.ToString();
     }

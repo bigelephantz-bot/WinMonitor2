@@ -274,7 +274,7 @@ public sealed partial class SettingsForm
     {
         if (MessageBox.Show(this, Loc.T("set.restore_defaults.confirm"), Loc.T("set.restore_defaults"),
                 MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-        _draftConfig = new AppConfig();
+        _draft.RestoreDefaults();
         LoadAllTabs();
     }
 
