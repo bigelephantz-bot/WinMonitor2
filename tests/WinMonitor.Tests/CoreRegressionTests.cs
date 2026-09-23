@@ -8,6 +8,7 @@ using WinMonitor.Core;
 using WinMonitor.Localization;
 using WinMonitor.Tray;
 using WinMonitor.UI;
+using WinMonitor.Tests;
 
 var tests = new (string Name, Action Run)[]
 {
@@ -24,6 +25,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(LocalizationCoverageTests), LocalizationCoverageTests),
     (nameof(AmbiguousSensorNameTests), AmbiguousSensorNameTests),
     (nameof(EcSensorComputeTests), EcSensorComputeTests),
+    (nameof(PersistedEcFanMappingTests), PersistedEcFanMappingTests),
     (nameof(ConfigMigrationTests), ConfigMigrationTests),
     (nameof(LoggingCompletenessTests), LoggingCompletenessTests),
     (nameof(PollThreadLifetimeTests), PollThreadLifetimeTests),
@@ -38,9 +40,22 @@ var tests = new (string Name, Action Run)[]
     (nameof(SessionSpoolFaultTests), SessionSpoolFaultTests),
     (nameof(CsvExportAtomicityTests), CsvExportAtomicityTests),
     (nameof(TrayIconMergeTests), TrayIconMergeTests),
-    (nameof(WindowIconOwnershipTests), WindowIconOwnershipTests),
+    (nameof(SettingsWindowIconOwnershipStructureTests), SettingsWindowIconOwnershipStructureTests),
     (nameof(TrayCanvasDpiTests), TrayCanvasDpiTests),
     (nameof(EcTimeoutBufferOwnershipTests), EcTimeoutBufferOwnershipTests),
+    (nameof(EcLifecycleTests.AvailabilityTransitions), EcLifecycleTests.AvailabilityTransitions),
+    (nameof(EcLifecycleTests.TimeoutResetLateCompletion), EcLifecycleTests.TimeoutResetLateCompletion),
+    (nameof(EcLifecycleTests.CompletedReadAndDispose), EcLifecycleTests.CompletedReadAndDispose),
+    (nameof(ChartWindowTests), ChartWindowTests.Run),
+    (nameof(AppLifecycleTests.EcSettingsPublication), AppLifecycleTests.EcSettingsPublication),
+    (nameof(AppLifecycleTests.SettingsDraftTransaction), AppLifecycleTests.SettingsDraftTransaction),
+    (nameof(AppLifecycleTests.ExportLifetime), AppLifecycleTests.ExportLifetime),
+    (nameof(AppLifecycleTests.DisplayEventWiring), AppLifecycleTests.DisplayEventWiring),
+    (nameof(HistoryLifecycleTests.RetiredSensorExport), HistoryLifecycleTests.RetiredSensorExport),
+    (nameof(HistoryLifecycleTests.MeasurementRevisions), HistoryLifecycleTests.MeasurementRevisions),
+    (nameof(HistoryLifecycleTests.ResetAndObservationState), HistoryLifecycleTests.ResetAndObservationState),
+    (nameof(HistoryLifecycleTests.BatchedHistoryScan), HistoryLifecycleTests.BatchedHistoryScan),
+    (nameof(HistoryLifecycleTests.VisibleWindowReuse), HistoryLifecycleTests.VisibleWindowReuse),
 };
 
 int failures = 0;
@@ -907,7 +922,7 @@ static void CsvExportAtomicityTests()
 /// </summary>
 static void TrayIconMergeTests()
 {
-    MethodInfo? merge = typeof(SettingsForm).GetMethod(
+    MethodInfo? merge = typeof(SettingsDraft).GetMethod(
         "MergeDraftNode", BindingFlags.Static | BindingFlags.NonPublic);
     Check.True(merge is not null, "The settings three-way merge should exist.");
 
@@ -968,30 +983,12 @@ static void TrayIconMergeTests()
 }
 
 /// <summary>
-/// ExtractAssociatedIcon transfers ownership of a real HICON. Form.Dispose does not release an Icon
-/// it was merely assigned, so every window that extracts one has to hold and free it.
+/// Structural guard only: SettingsForm retains its extracted icon and declares its own disposal.
+/// This does not prove handle release. The former Explorer disposal behavior check was removed
+/// with that UI; exercising SettingsForm's disposal still requires a live application context.
 /// </summary>
-static void WindowIconOwnershipTests()
+static void SettingsWindowIconOwnershipStructureTests()
 {
-    // EcExplorerForm is constructible without a running application, so its disposal is checked
-    // for real: build one, dispose it, and prove the icon it extracted was released.
-    using var ec = new EmbeddedController();
-    var form = new EcExplorerForm(ec, new EcConfig(), () => { }, () => (float.NaN, float.NaN));
-    FieldInfo? field = typeof(EcExplorerForm).GetField("_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
-    Check.True(field is not null, "EcExplorerForm should retain the icon it extracts.");
-
-    var icon = (Icon?)field!.GetValue(form);
-    form.Dispose();
-    if (icon is not null)
-    {
-        bool released = false;
-        try { _ = icon.Handle; } catch (ObjectDisposedException) { released = true; }
-        Check.True(released, "Disposing the form must release the icon it owns.");
-    }
-    Check.True(field.GetValue(form) is null, "Disposal should clear the owned icon reference.");
-
-    // SettingsForm needs a live WinMonitorContext (which opens hardware), so its identical pattern
-    // is only guarded structurally. This is a shape check, not proof that disposal releases.
     FieldInfo? settingsField = typeof(SettingsForm).GetField(
         "_windowIcon", BindingFlags.Instance | BindingFlags.NonPublic);
     Check.True(settingsField is not null, "SettingsForm should retain the icon it extracts.");
@@ -1378,6 +1375,54 @@ static void EcSensorComputeTests()
     lastOk[0xFF] = true;
     Check.True(Def(EcValueKind.RpmDirect, 0xFF).Compute(regs, lastOk) is null,
         "A word sensor at register 0xFF has no high byte and must return null.");
+}
+
+/// <summary>
+/// Removing the scan UI must not discard an existing verified fan mapping on config load/save.
+/// This checks persistence and RPM conversion only; actual EC reads still need target hardware.
+/// </summary>
+static void PersistedEcFanMappingTests()
+{
+    using var scope = new ScopedConfigDirectory();
+    const string persisted = """
+        {
+          "SchemaVersion": 4,
+          "Ec": {
+            "Enabled": true,
+            "AppliedDefaultProfile": "lg-16t90r-gram360-gp",
+            "Sensors": [{
+              "Enabled": true, "Register": 176, "Name": "CPU Fan",
+              "NameKey": "ec.default_name", "Kind": "RpmDirect",
+              "BigEndian": false, "Scale": 1, "Offset": 0, "Quantity": "Fan"
+            }]
+          }
+        }
+        """;
+    File.WriteAllText(Path.Combine(scope.Path, "config.json"), persisted);
+
+    AppConfig loaded = ConfigStore.Load();
+    ConfigStore.Save(loaded);
+    AppConfig reloaded = ConfigStore.Load();
+    Check.True(reloaded.Ec.Enabled, "An existing fan mapping must remain enabled after load/save.");
+    Check.Equal("lg-16t90r-gram360-gp", reloaded.Ec.AppliedDefaultProfile ?? "",
+        "The known-model marker must survive without the Explorer UI.");
+    Check.Equal(1, reloaded.Ec.Sensors.Count, "The saved fan mapping must survive exactly once.");
+
+    EcSensorDef fan = reloaded.Ec.Sensors[0];
+    Check.True(fan.Enabled && fan.Quantity == SensorQuantity.Fan && fan.Category == SensorCategory.Fan,
+        "The saved mapping must still be classified as an enabled fan sensor.");
+    Check.Equal("/ec/reg/B0/RpmDirect", fan.SensorId,
+        "The stable fan id must survive so existing tray and chart references remain valid.");
+    var regs = new byte[256];
+    var ok = new bool[256];
+    regs[0xB0] = 0x48;
+    regs[0xB1] = 0x0D;
+    ok[0xB0] = ok[0xB1] = true;
+    Check.Equal(3400f, fan.Compute(regs, ok) ?? -1f,
+        "The persisted 0xB0/0xB1 little-endian pair must still convert to 3400 RPM.");
+    ok[0xB1] = false;
+    Check.True(fan.Compute(regs, ok) is null,
+        "The persisted mapping must not invent a fan value when either register is unread.");
 }
 
 static void ConfigMigrationTests()

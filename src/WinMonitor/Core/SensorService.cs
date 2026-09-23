@@ -96,17 +96,11 @@ public sealed class SensorService : IDisposable
 
     // Embedded Controller (LG fan support). Read-only; its own methods are internally locked.
     private readonly EmbeddedController _ec = new();
-    // The poll thread reads ONLY this immutable snapshot, never the live Config.Ec.Sensors list
-    // (which the EC Explorer mutates on the UI thread) — set atomically via SetEcSensorSnapshot.
+    // The poll thread reads ONLY this immutable snapshot, never the UI-owned Config.Ec.Sensors
+    // list. Start and RefreshEcSensors publish a deep copy.
     private volatile EcSensorDef[] _ecConfigSnapshot = Array.Empty<EcSensorDef>();
-    private EcSensorDef[] _ecSensors = Array.Empty<EcSensorDef>();   // swapped under _sync
-    private int[] _ecRegisters = Array.Empty<int>();                 // exact registers to read per tick
+    private EcSensorSampler? _ecSampler; // replaced under _sync; used only by the poll thread
     private volatile bool _descriptorRebuildRequested;               // EC config edited -> rebuild descriptors only
-    // EC read throttling: only touch the EC every EcReadEveryNTicks ticks; between reads we re-emit
-    // the last computed values so tray/stats/history stay continuous. Sized to _ecSensors.Length and
-    // reset (all null) whenever _ecSensors is swapped in RebuildDescriptors, all under _sync.
-    private int _ecTickCounter;
-    private float?[] _ecLastValues = Array.Empty<float?>();
 
     private volatile IReadOnlyList<SensorDescriptor> _descriptors = Array.Empty<SensorDescriptor>();
     // Exact LHM ids for fixed NVMe warning/critical limits excluded from Descriptors. The config
@@ -144,7 +138,7 @@ public sealed class SensorService : IDisposable
     public IReadOnlyList<string> SuppressedStorageTemperatureLimitSensorIds
         => _suppressedStorageTemperatureLimitSensorIds;
 
-    /// <summary>Shared read-only Embedded Controller accessor (used by the EC Explorer UI too).</summary>
+    /// <summary>Read-only EC accessor for explicitly invoked standalone diagnostics.</summary>
     public EmbeddedController Ec => _ec;
 
     /// <summary>
@@ -307,7 +301,7 @@ public sealed class SensorService : IDisposable
     }
 
     /// <summary>
-    /// Rebuild descriptors after the EC sensor set changed (add/remove in the EC Explorer).
+    /// Rebuild descriptors after persisted EC definitions or defaults change.
     /// The caller passes an immutable snapshot built on its own thread, so the poll thread never
     /// touches the live Config.Ec.Sensors list. Lighter than RescanHardware (no LHM reopen).
     /// </summary>
@@ -455,9 +449,7 @@ public sealed class SensorService : IDisposable
             bool[]? activeNodesSlow;
             WmiZoneEntry[]? activeZones;
             Dictionary<IHardware, int> nodeFailures;
-            EcSensorDef[] ecSensors;
-            int[] ecRegisters;
-            float?[] ecLastValues;
+            EcSensorSampler? ecSampler;
             ThrottleInput[] throttleDistance;
             ThrottleInput? throttleFallback;
             lock (_sync)
@@ -471,9 +463,7 @@ public sealed class SensorService : IDisposable
                 activeNodesSlow = _activeNodesSlow;
                 activeZones = _activeZones;
                 nodeFailures = _nodeFailures;
-                ecSensors = _ecSensors;
-                ecRegisters = _ecRegisters;
-                ecLastValues = _ecLastValues;
+                ecSampler = _ecSampler;
                 throttleDistance = _throttleDistanceSensors;
                 throttleFallback = _throttleFallbackSensor;
             }
@@ -549,46 +539,15 @@ public sealed class SensorService : IDisposable
             SensorEntry[] entries = full ? allEntries : activeEntries!;
             WmiZoneEntry[] zones = full ? allZones : activeZones!;
 
-            bool emitEc = ecSensors.Length > 0 && _ec.Available && ecLastValues.Length == ecSensors.Length;
-
-            // EC read throttling: only touch the EC every Nth tick. We emit EC snapshots ONLY on
-            // read ticks — re-emitting cached values on skip ticks would feed StatsTracker/history
-            // duplicate samples with fresh timestamps, skewing min/max/avg and the chart. The tray
-            // already retains the last value between reads (its own _latest cache), so throttling
-            // just lowers the EC sample rate, exactly as intended.
-            bool ecReadTick = false;
-            if (emitEc)
-            {
-                int everyN = Math.Max(1, config.EcReadEveryNTicks);
-                // Read on the first tick after a rebuild (counter 0) and every Nth tick after.
-                ecReadTick = _ecTickCounter % everyN == 0;
-                _ecTickCounter++;
-                if (ecReadTick && ecRegisters.Length > 0)
-                {
-                    // Read only the exact registers the sensors need, with a small time budget so a
-                    // wedged EC can never stall this tick (see EmbeddedController budget).
-                    byte[]? ecRaw = _ec.ReadRegisters(ecRegisters, out bool[]? ecRawOk);
-                    if (ecRaw is not null && ecRawOk is not null)
-                    {
-                        // Scatter the sparse read into full-register space so EcSensorDef.Compute,
-                        // which addresses regs[0..255], reads the right offsets.
-                        var regs = new byte[256];
-                        var okFull = new bool[256];
-                        for (int i = 0; i < ecRegisters.Length; i++)
-                        {
-                            int addr = ecRegisters[i];
-                            if ((uint)addr <= 0xFF) { regs[addr] = ecRaw[i]; okFull[addr] = ecRawOk[i]; }
-                        }
-                        for (int i = 0; i < ecSensors.Length; i++)
-                            ecLastValues[i] = ecSensors[i].Compute(regs, okFull);
-                    }
-                }
-            }
-            int ecEmit = (emitEc && ecReadTick) ? ecSensors.Length : 0;
+            DateTime utc = DateTime.UtcNow;
+            // Healthy skipped ticks are omitted; unavailable EC sensors explicitly clear every
+            // configured ID so an out-of-band backend failure cannot leave a stale RPM visible.
+            ReadOnlySpan<SensorSnapshot> ecSamples = ecSampler is null
+                ? ReadOnlySpan<SensorSnapshot>.Empty
+                : ecSampler.Poll(utc, config.EcReadEveryNTicks);
             int throttleEmit = (throttleEnabled || throttleFinalClear) ? 1 : 0;
 
-            DateTime utc = DateTime.UtcNow;
-            var snapshots = new SensorSnapshot[entries.Length + zones.Length + ecEmit + throttleEmit];
+            var snapshots = new SensorSnapshot[entries.Length + zones.Length + ecSamples.Length + throttleEmit];
             int n = 0;
             bool cpuTelemetryAvailable = false;
             for (int i = 0; i < entries.Length; i++)
@@ -610,11 +569,8 @@ public sealed class SensorService : IDisposable
             for (int i = 0; i < zones.Length; i++)
                 snapshots[n++] = new SensorSnapshot { Id = zones[i].Id, Value = zones[i].LastValue, UtcTimestamp = utc };
 
-            if (emitEc && ecReadTick)
-            {
-                for (int i = 0; i < ecSensors.Length; i++)
-                    snapshots[n++] = new SensorSnapshot { Id = ecSensors[i].SensorId, Value = ecLastValues[i], UtcTimestamp = utc };
-            }
+            ecSamples.CopyTo(snapshots.AsSpan(n));
+            n += ecSamples.Length;
 
             if (throttleEnabled)
                 snapshots[n++] = new SensorSnapshot { Id = WellKnown.ThrottleSensorId, Value = _throttleState ? 1f : 0f, UtcTimestamp = utc };
@@ -623,9 +579,8 @@ public sealed class SensorService : IDisposable
 
             // "Complete" means every descriptor was actually sampled this tick: the full node sweep
             // ran, and — when EC sensors exist — this was one of their throttled read ticks. EC
-            // sensors that are configured but unavailable can never be sampled, so they must not
-            // hold completeness hostage; the descriptors are there but nothing will ever fill them.
-            bool complete = full && (!emitEc || ecReadTick);
+            // sensors that are unavailable carry explicit nulls and do not hold completeness hostage.
+            bool complete = full && (ecSampler?.Complete ?? true);
             SnapshotUpdated?.Invoke(snapshots, complete);
             Volatile.Write(ref _lastSnapshotCount, n);
             Interlocked.Increment(ref _successfulPollCount);
@@ -916,11 +871,7 @@ public sealed class SensorService : IDisposable
             _allNodesSlow = nodesSlow;
             _allZones = zones.ToArray();
             _nodeFailures = new Dictionary<IHardware, int>();
-            _ecSensors = ecSensors;
-            _ecRegisters = ecRegisters;
-            // Keep _ecLastValues in lockstep with the new sensor set (fresh all-null buffer).
-            _ecLastValues = ecSensors.Length > 0 ? new float?[ecSensors.Length] : Array.Empty<float?>();
-            _ecTickCounter = 0;
+            _ecSampler = new EcSensorSampler(_ec, ecSensors, ecRegisters);
             _throttleDistanceSensors = tjMaxDistance.ToArray();
             _throttleFallbackSensor = throttleFallback;
             // AddHardwareNode just Update()d every node (slow ones included) — counts as a slow update.
@@ -1009,13 +960,19 @@ public sealed class SensorService : IDisposable
     /// <summary>
     /// Appends descriptors for the user's EC sensors (LG fans etc.) and returns the definition
     /// array plus the exact (deduplicated) register list to read each tick. Reads the immutable
-    /// snapshot, never the live config list, so it can't race the EC Explorer's edits.
+    /// snapshot, never the live config list, so it can't race settings replacement.
     /// </summary>
     private EcSensorDef[] BuildEcDescriptors(List<SensorDescriptor> descriptors, HashSet<string> seen, out int[] readRegisters)
     {
         readRegisters = Array.Empty<int>();
         if (!CurrentConfig.Ec.Enabled) return Array.Empty<EcSensorDef>();
-        if (!_ec.Available && !_ec.Initialize()) return Array.Empty<EcSensorDef>();
+        // Keep enabled definitions visible even when the driver is unavailable. The sampler emits
+        // nulls for these IDs; dropping descriptors would hide both failure state and history.
+        if (!_ec.Available)
+        {
+            try { _ec.Initialize(); }
+            catch (Exception ex) { Diag.Log("ec", "EC initialization failed", ex); }
+        }
 
         var list = new List<EcSensorDef>();
         var regs = new SortedSet<int>();
@@ -1031,6 +988,7 @@ public sealed class SensorService : IDisposable
                 Name = def.DisplayName,
                 Category = def.Category,
                 Quantity = def.Quantity,
+                MeasurementKey = def.MeasurementKey,
             });
             regs.Add(def.Register);
             // Word/RPM kinds also need the high byte at Register+1.

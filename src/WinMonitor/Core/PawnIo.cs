@@ -11,7 +11,7 @@ namespace WinMonitor.Core;
 /// reach the ACPI Embedded Controller, which LHM's Super-I/O path cannot see on LG laptops.
 /// All calls return an HRESULT (0 = S_OK). This type is not thread-safe; callers serialize.
 /// </summary>
-public sealed class PawnIo : IDisposable
+public sealed class PawnIo : IDisposable, IEcPortAccess
 {
     private IntPtr _handle;
     private bool _disposed;
