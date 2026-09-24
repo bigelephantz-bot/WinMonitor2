@@ -136,6 +136,7 @@ public sealed class WinMonitorContext : ApplicationContext
     private volatile bool _exiting;
     private bool _sessionEndingHooked;
     private bool _powerModeHooked;
+    private readonly bool _enableSystemIntegration;
     private DisplayMetricsSubscription? _displayMetricsSubscription;
 
     // Auto peak reset (item 15): 1-minute schedule check + a guard so one target minute
@@ -166,7 +167,14 @@ public sealed class WinMonitorContext : ApplicationContext
     private int _startupRegistrationGeneration;
 
     public WinMonitorContext(AppConfig config, bool startMinimized)
+        : this(config, startMinimized, enableSystemIntegration: true)
     {
+    }
+
+    /// <summary>Isolated resource probes can run the real UI/polling without changing OS startup state.</summary>
+    internal WinMonitorContext(AppConfig config, bool startMinimized, bool enableSystemIntegration)
+    {
+        _enableSystemIntegration = enableSystemIntegration;
         _config = config;
         _lastThrottleEnabled = config.ThrottleIndicatorEnabled;
 
@@ -239,7 +247,7 @@ public sealed class WinMonitorContext : ApplicationContext
         // Repair autostart registration if the exe moved since last run without delaying startup.
         QueueStartupRegistration(reportFailure: false);
 
-        StartActivationPipe();
+        if (_enableSystemIntegration) StartActivationPipe();
 
         if (!startMinimized)
         {
@@ -447,6 +455,7 @@ public sealed class WinMonitorContext : ApplicationContext
     /// <summary>Applies the hotkey registration to match current config (unregister + register).</summary>
     private void ApplyHotkeyRegistration()
     {
+        if (!_enableSystemIntegration) return;
         _sync.UnregisterCompactHotkey();
         if (!Config.HotkeyEnabled) return;
         if (!_sync.RegisterCompactHotkey(Config.HotkeyModifiers, Config.HotkeyKey))
@@ -548,6 +557,7 @@ public sealed class WinMonitorContext : ApplicationContext
     /// </summary>
     private void QueueStartupRegistration(bool reportFailure)
     {
+        if (!_enableSystemIntegration) return;
         var snapshot = new AppConfig
         {
             StartWithWindows = Config.StartWithWindows,
