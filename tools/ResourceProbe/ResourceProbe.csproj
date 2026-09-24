@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <AssemblyName>WinMonitor.ResourceProbe</AssemblyName>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <NuGetAudit>false</NuGetAudit>
+    <!-- Match the app's workstation, non-concurrent, memory-conserving runtime. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="5" />
+    <ProjectReference Include="../../src/WinMonitor/WinMonitor.csproj" />
+  </ItemGroup>
+</Project>

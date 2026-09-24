@@ -30,6 +30,7 @@ var tests = new (string Name, Action Run)[]
     (nameof(LoggingCompletenessTests), LoggingCompletenessTests),
     (nameof(PollThreadLifetimeTests), PollThreadLifetimeTests),
     (nameof(TrayLatestValuePruneTests), TrayLatestValuePruneTests),
+    (nameof(TraySparklineTests.UnchangedSamplesAdvance), TraySparklineTests.UnchangedSamplesAdvance),
     (nameof(NativeCallGateTests), NativeCallGateTests),
     (nameof(EcMutexFailClosedTests), EcMutexFailClosedTests),
     (nameof(IconHandleOwnershipTests), IconHandleOwnershipTests),

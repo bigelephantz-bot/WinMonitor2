@@ -15,7 +15,7 @@ namespace WinMonitor.Tray;
 /// called on the sensor background thread and only writes into a ConcurrentDictionary plus
 /// schedules ONE coalesced BeginInvoke; every NotifyIcon/GDI operation happens on the UI
 /// thread anchored by the ISynchronizeInvoke passed to the constructor (SyncWindow).
-/// Icons are re-rendered only when their text/color/style actually changed, and every
+/// Icons are re-rendered only when their text/color/style or sparkline window changed, and every
 /// replaced HICON is destroyed through IconRenderer.ReleaseIcon.
 /// </summary>
 public sealed class TrayIconManager : IDisposable
@@ -66,6 +66,8 @@ public sealed class TrayIconManager : IDisposable
     private readonly ISynchronizeInvoke _sync;
     private readonly List<IconSlot> _slots = new();
     private readonly ConcurrentDictionary<string, float?> _latest = new(StringComparer.Ordinal);
+    // Immutable after publication by RebuildCore; the poll thread never reads UI-owned slots.
+    private HashSet<string> _sparklineSensorIds = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Thresholds> _thresholdCache = new(StringComparer.Ordinal); // UI thread only; cleared on Rebuild
     private readonly StringBuilder _tooltipBuilder = new(80); // UI thread only
     private readonly Action _redrawMarshaledAction;           // cached: no delegate alloc per tick
@@ -155,17 +157,21 @@ public sealed class TrayIconManager : IDisposable
         if (_disposed) return;
 
         bool changed = false;
+        bool historyAdvanced = false;
+        HashSet<string> sparklineIds = Volatile.Read(ref _sparklineSensorIds);
         for (int i = 0; i < snapshots.Length; i++)
         {
             var s = snapshots[i];
+            if (s.Value is { } sample && float.IsFinite(sample) && sparklineIds.Contains(s.Id))
+                historyAdvanced = true;
             float? next = s.HasValue ? s.Value : null;
             if (_latest.TryGetValue(s.Id, out var prev) && FloatsEqual(prev, next)) continue;
             _latest[s.Id] = next;
             changed = true;
         }
-        // Nothing new (first-time entries count as changes): rotation timers redraw on
-        // their own schedule, so skipping the marshal here keeps idle ticks free.
-        if (!changed) return;
+        // Equal-valued samples still advance a sparkline window. RedrawSlot's full-window hash
+        // decides whether an HICON needs replacing; numeric-only unchanged ticks remain free.
+        if (!changed && !historyAdvanced) return;
 
         // If a redraw is already queued for the UI thread, skip: it will pick up the
         // values we just stored. Prevents BeginInvoke pile-up when the UI thread stalls.
@@ -234,9 +240,22 @@ public sealed class TrayIconManager : IDisposable
         _slots.Clear();
 
         var configs = _configProvider().Active.TrayIcons;
+        var sparklineIds = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < configs.Count; i++)
         {
             var cfg = configs[i];
+            if (cfg.ShowSparkline)
+            {
+                if (cfg.SensorIds.Count == 0)
+                {
+                    string? auto = SensorPicker.PickAuto(descriptors);
+                    if (auto is not null) sparklineIds.Add(auto);
+                }
+                else
+                {
+                    foreach (string id in cfg.SensorIds) sparklineIds.Add(id);
+                }
+            }
             var slot = new IconSlot { Cfg = cfg };
 
             if (!string.IsNullOrWhiteSpace(cfg.ColorOverride))
@@ -284,6 +303,8 @@ public sealed class TrayIconManager : IDisposable
             notify.Visible = true;
             _slots.Add(slot);
         }
+
+        Volatile.Write(ref _sparklineSensorIds, sparklineIds);
 
         // Real icons exist again: the balloon-only fallback is no longer needed.
         if (_slots.Count > 0 && _fallbackBalloon is not null)
@@ -465,9 +486,8 @@ public sealed class TrayIconManager : IDisposable
     /// Fills <see cref="IconSlot.SparkBuffer"/> with the last <see cref="SparklineSamples"/>
     /// history values for <paramref name="id"/> (oldest→newest) and sets
     /// <see cref="IconSlot.SparkCount"/>. The buffer is allocated once per slot and reused, so
-    /// this only touches an index-based copy — no per-tick List/LINQ allocation. The
-    /// <see cref="StatsTracker.GetHistory"/> snapshot itself is copied on its side; we read it
-    /// via the indexer without an enumerator.
+    /// this only touches an index-based copy of the last N samples via
+    /// <see cref="StatsTracker.CopyRecentHistory"/> — no full-history copy or LINQ allocation.
     /// </summary>
     private void SampleSparkline(IconSlot slot, string? id)
     {
