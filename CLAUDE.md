@@ -71,3 +71,20 @@ Non-elevated runs are degraded **by design** (battery + CPU load only; CPU temps
 ## Repo state
 
 Git remote is `bigelephantz-bot/WinMonitor2`. Work happens on `agent/*` branches; the default branch is `main` and feature branches may be ahead of it. Commit subjects are short, imperative and scoped (`Core: handle missing sensor values`). Call out new localization keys and config-schema changes in PR descriptions.
+
+## Working with Codex
+
+Read and follow **AGENTS.md → Codex / Claude Code Collaboration** before editing; it is the
+single shared source for branch ownership, path claims, worktree commands, handoff, synchronization,
+merge order, and main protection. Keep the existing build/test and architecture rules above.
+
+- Create new work on `agent/claude/<unique-task>` in a dedicated sibling worktree. Only this
+  Claude Code session writes that branch; never edit or push a Codex-owned branch/worktree.
+- Confirm assigned whole-file paths and shared interfaces before parallel edits. Shared files
+  (including localization and the regression registration array) have one writer at a time.
+- To resume Codex work, require a committed/pushed handoff with a verified full SHA, then create
+  your own successor branch and acknowledge the transfer. Preserve handed-off history; if the
+  source is already merged, start from latest `origin/main` instead.
+- Use the shared PR coordination block and report actual validation plus remaining work.
+  Never push directly to `main`, merge a PR without a separate explicit instruction, or treat
+  a second agent using the same GitHub account as an independent approving reviewer.
